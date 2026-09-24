@@ -21,7 +21,9 @@ Features:
 
 ## Install
 
-Download the binary
+Download a pre-built binary from the [Releases](Releases/) folder:
+
+- [StOMP 0.1](Releases/StOMP-0.1) (x86_64 Linux)
 
 Mark it executable
 
