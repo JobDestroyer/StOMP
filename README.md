@@ -137,7 +137,7 @@ There is no PipeWire/Pulse loopback and no microphone path.
 
 ## License
 
-Copyright (C) 2026 the StOMP authors.
+Copyright (C) 2026 JobDestroyer.
 
 StOMP is free software: you can redistribute it and/or modify it under the
 terms of the **GNU Lesser General Public License, version 2.1**, the same
