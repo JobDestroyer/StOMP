@@ -13,6 +13,12 @@ Features:
  - Can manage large music libraries of over 10,000 music files without issue
  - Compatibility with MusicControlol Decky plugin; play music while playing games! 
  
+## Screenshots
+
+![StOMP interface](assets/StOMP_Interface.jpg)
+
+![StOMP interface 2](assets/StOMP_Interface2.jpg)
+
 ## Install
 
 Download the binary
