@@ -1,0 +1,54 @@
+# Build and packer output (repo-root only)
+/build/
+/out/
+/stomp
+/vibe
+/vibe-core
+/vibe-stub
+/packembed
+
+# Compiled objects and static libs. Keep the vendored SQLite archive.
+*.o
+*.a
+!third_party/libsqlite3.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# CMake / Ninja (if someone configures in-tree)
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+cmake_install.cmake
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+install_manifest.txt
+Makefile
+build.ninja
+.ninja_deps
+.ninja_log
+
+# Runtime data that belongs in ~/.config and ~/.local/share
+*.db
+*.db-wal
+*.db-shm
+.cache/
+
+# Editors and OS
+*~
+.#*
+*.swp
+*.swo
+*.kate-swp
+.README.md.kate-swp
+AGENTS.md
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.user
+.clangd/
+.cache/clangd/
