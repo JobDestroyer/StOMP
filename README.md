@@ -106,8 +106,8 @@ unbound (Big Picture / on-screen keyboard).
 |----------|---------|----------|
 | Play / confirm | A | Enter, Space |
 | Back / hide HUD | B | Esc |
-| Add to queue | X | X |
-| Search / queue remove | Y | Y |
+| Dislike visualization | X | X |
+| Like visualization | Y | Y |
 | Library | Start | Tab |
 | Stop | Select | End |
 | Queue | R3 | Q |
