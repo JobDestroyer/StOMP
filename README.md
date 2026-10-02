@@ -21,15 +21,23 @@ Features:
 
 ## Install
 
-Download a pre-built binary from the [Releases](Releases/) folder:
+On a Steam Machine or SteamOS desktop session (one line):
 
-- [StOMP 0.1](Releases/StOMP-0.1) (x86_64 Linux)
+```bash
+curl -fsSL https://raw.githubusercontent.com/JobDestroyer/StOMP/main/install.sh | bash
+```
 
-Mark it executable
+That copies StOMP to `~/.local/share/stomp/stomp`, adds a Steam library shortcut, and installs Big Picture / library art. Restart Steam (or return to Gaming Mode) once.
 
-Run it to test without installing
+From a built source tree, with Steam closed or in Desktop Mode:
 
-Add to Steam in Desktop Mode if you want to have it available in Big Picture
+```bash
+./install.sh
+```
+
+The installer uses `./build/stomp` or `./Releases/StOMP-0.1` if present, otherwise GitHub Releases. Override with `STOMP_BIN=/path/to/stomp ./install.sh`.
+
+Manual: download a pre-built binary from [Releases](Releases/), `chmod +x`, run it, or add it in Steam Desktop Mode.
 
 
 
