@@ -35,9 +35,9 @@ From a built source tree, with Steam closed or in Desktop Mode:
 ./install.sh
 ```
 
-The installer uses `./build/stomp` or `./Releases/StOMP-0.1` if present, otherwise GitHub Releases. Override with `STOMP_BIN=/path/to/stomp ./install.sh`.
+The installer uses `./build/stomp` if present, otherwise the latest GitHub Release. Override with `STOMP_BIN=/path/to/stomp ./install.sh`.
 
-Manual: download a pre-built binary from [Releases](Releases/), `chmod +x`, run it, or add it in Steam Desktop Mode.
+Manual: download `stomp` from [GitHub Releases](https://github.com/JobDestroyer/StOMP/releases), `chmod +x`, run it, or add it in Steam Desktop Mode.
 
 
 

@@ -38,10 +38,9 @@ find_local_bin() {
   for c in \
     "${STOMP_BIN:-}" \
     "${ROOT:+${ROOT}/build/stomp}" \
-    "${ROOT:+${ROOT}/Releases/StOMP-0.1}" \
     "${ROOT:+${ROOT}/stomp}" \
     "./build/stomp" \
-    "./Releases/StOMP-0.1"
+    "./stomp"
   do
     [[ -n "$c" && -f "$c" && -r "$c" ]] && { printf '%s\n' "$c"; return 0; }
   done
@@ -59,7 +58,7 @@ if SRC_BIN="$(find_local_bin)"; then
 else
   log "downloading stomp from GitHub Releases"
   tmp="$(mktemp)"
-  if fetch "${REL_BASE}/stomp" "$tmp" || fetch "${RAW_BASE}/Releases/StOMP-0.1" "$tmp"; then
+  if fetch "${REL_BASE}/stomp" "$tmp"; then
     SRC_BIN="$tmp"
   else
     rm -f "$tmp"
