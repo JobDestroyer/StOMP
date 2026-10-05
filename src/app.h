@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #ifndef VIBE_APP_H
 #define VIBE_APP_H
 
@@ -51,6 +55,7 @@ void app_prev_track(App *app);
 void app_toggle_pause(App *app);
 void app_resume_playback(App *app);
 void app_stop(App *app);
+void app_halt(App *app);
 void app_seek_delta(App *app, double seconds);
 void app_set_volume_delta(App *app, float d);
 void app_apply_profile(App *app, int force);

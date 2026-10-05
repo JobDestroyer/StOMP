@@ -1,5 +1,7 @@
+# SPDX-License-Identifier: LGPL-2.1-only
+# Copyright (C) 2026 JobDestroyer
 cmake_minimum_required(VERSION 3.21)
-project(vibe C CXX)
+project(StOMP VERSION 0.2.0 LANGUAGES C CXX)
 
 # Do not force a strict C standard globally: libprojectM's eval C sources
 # need POSIX APIs (strdup, strcasecmp) which vanish under -std=c17.
@@ -34,6 +36,21 @@ pkg_check_modules(FREETYPE REQUIRED freetype2)
 pkg_check_modules(GL REQUIRED gl)
 pkg_check_modules(DBUS REQUIRED dbus-1)
 
+# SQLite amalgamation (public domain). Built here so the tree is complete source.
+add_library(stomp-sqlite STATIC third_party/sqlite3.c)
+set_target_properties(stomp-sqlite PROPERTIES
+    C_STANDARD 99
+    C_EXTENSIONS ON
+)
+target_include_directories(stomp-sqlite PUBLIC "${CMAKE_SOURCE_DIR}/third_party")
+target_compile_definitions(stomp-sqlite PRIVATE
+    SQLITE_THREADSAFE=1
+    SQLITE_DQS=0
+    SQLITE_DEFAULT_MEMSTATUS=0
+    SQLITE_OMIT_LOAD_EXTENSION
+)
+target_compile_options(stomp-sqlite PRIVATE -w)
+
 add_executable(vibe-core
     src/main.c
     src/app.c
@@ -42,6 +59,7 @@ add_executable(vibe-core
     src/decode.c
     src/ringbuf.c
     src/library.c
+    src/playlist.c
     src/input.c
     src/ui.c
     src/viz.c
@@ -77,7 +95,7 @@ target_link_libraries(vibe-core PRIVATE
     ${FREETYPE_LIBRARIES}
     ${GL_LIBRARIES}
     ${DBUS_LIBRARIES}
-    "${CMAKE_SOURCE_DIR}/third_party/libsqlite3.a"
+    stomp-sqlite
     m
     pthread
     dl

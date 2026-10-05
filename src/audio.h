@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #ifndef VIBE_AUDIO_H
 #define VIBE_AUDIO_H
 
@@ -20,6 +24,8 @@ void audio_set_volume(float v);
 float audio_volume(void);
 void audio_pause(int paused);
 int audio_paused(void);
+void audio_lock(void);
+void audio_unlock(void);
 void audio_list_devices(char names[][128], int *count, int cap);
 
 #endif

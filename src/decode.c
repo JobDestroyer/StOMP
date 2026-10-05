@@ -1,5 +1,10 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #include "decode.h"
 
+#include "audio.h"
 #include "library.h"
 
 #include <SDL.h>
@@ -88,7 +93,13 @@ static int open_file(const char *path, AVFormatContext **fmt, AVCodecContext **c
     int si, err;
     AVChannelLayout out_ch = AV_CHANNEL_LAYOUT_STEREO;
 
-    s_title[0] = s_artist[0] = s_album[0] = s_icy[0] = '\0';
+    if (s_mtx) {
+        SDL_LockMutex(s_mtx);
+        s_title[0] = s_artist[0] = s_album[0] = s_icy[0] = '\0';
+        SDL_UnlockMutex(s_mtx);
+    } else {
+        s_title[0] = s_artist[0] = s_album[0] = s_icy[0] = '\0';
+    }
     atomic_store(&s_pos_ms, 0);
     atomic_store(&s_dur_ms, 0);
     *fmt = NULL;
@@ -212,13 +223,18 @@ static int write_pcm(const float *src, int frames)
         uint32_t space = ringbuf_space(s_ring);
         uint32_t chunk;
         if (space == 0) {
-            SDL_Delay(4);
             SDL_LockMutex(s_mtx);
+            while (s_cmd == CMD_NONE && s_paused) {
+                SDL_CondWait(s_cond, s_mtx);
+            }
             if (s_cmd != CMD_NONE) {
                 SDL_UnlockMutex(s_mtx);
                 return -1;
             }
             SDL_UnlockMutex(s_mtx);
+            if (ringbuf_space(s_ring) == 0) {
+                SDL_Delay(4);
+            }
             continue;
         }
         chunk = (uint32_t)(frames - off);
@@ -323,12 +339,14 @@ static int thread_main(void *ud)
             SDL_UnlockMutex(s_mtx);
             pkt_errs = 0;
             close_ctx(&fmt, &cc, &swr, &pkt, &fr);
+            audio_lock();
             ringbuf_clear(s_ring);
+            audio_unlock();
             atomic_store(&s_ended, 0);
             atomic_store(&s_failed, 0);
-            s_live = (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0);
             if (open_file(path, &fmt, &cc, &swr, &pkt, &fr, &stream_i) == 0) {
-                if (!s_live && pending >= 0.0 && stream_i >= 0) {
+                int live = (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0);
+                if (!live && pending >= 0.0 && stream_i >= 0) {
                     int64_t ts = (int64_t)(pending / av_q2d(fmt->streams[stream_i]->time_base));
                     av_seek_frame(fmt, stream_i, ts, AVSEEK_FLAG_BACKWARD);
                     avcodec_flush_buffers(cc);
@@ -338,11 +356,15 @@ static int thread_main(void *ud)
                     set_pos_sec(pending);
                 }
                 SDL_LockMutex(s_mtx);
+                s_live = live;
                 s_have_file = 1;
                 SDL_UnlockMutex(s_mtx);
             } else {
                 fprintf(stderr, "StOMP: skip unreadable file\n");
                 atomic_store(&s_failed, 1);
+                SDL_LockMutex(s_mtx);
+                s_live = 0;
+                SDL_UnlockMutex(s_mtx);
             }
             continue;
         }
@@ -352,14 +374,17 @@ static int thread_main(void *ud)
             s_live = 0;
             SDL_UnlockMutex(s_mtx);
             close_ctx(&fmt, &cc, &swr, &pkt, &fr);
+            audio_lock();
             ringbuf_clear(s_ring);
+            audio_unlock();
             continue;
         }
         if (cmd == CMD_SEEK) {
             double sec = s_seek_sec;
+            int live = s_live;
             s_cmd = CMD_NONE;
             SDL_UnlockMutex(s_mtx);
-            if (s_live) {
+            if (live) {
                 continue;
             }
             if (fmt && stream_i >= 0) {
@@ -369,7 +394,9 @@ static int thread_main(void *ud)
                 if (swr) {
                     swr_init(swr);
                 }
+                audio_lock();
                 ringbuf_clear(s_ring);
+                audio_unlock();
                 set_pos_sec(sec);
             }
             continue;
@@ -405,10 +432,23 @@ static int thread_main(void *ud)
                 av_frame_unref(fr);
             }
             convert_and_write(swr, NULL, fmt, stream_i);
-            atomic_store(&s_ended, 1);
-            SDL_LockMutex(s_mtx);
-            s_have_file = 0;
-            SDL_UnlockMutex(s_mtx);
+            for (;;) {
+                int drain_cmd;
+                SDL_LockMutex(s_mtx);
+                drain_cmd = s_cmd;
+                SDL_UnlockMutex(s_mtx);
+                if (drain_cmd != CMD_NONE) {
+                    break;
+                }
+                if (ringbuf_fill(s_ring) == 0) {
+                    atomic_store(&s_ended, 1);
+                    SDL_LockMutex(s_mtx);
+                    s_have_file = 0;
+                    SDL_UnlockMutex(s_mtx);
+                    break;
+                }
+                SDL_Delay(4);
+            }
             close_ctx(&fmt, &cc, &swr, &pkt, &fr);
             continue;
         }
@@ -534,16 +574,21 @@ void decode_seek(double seconds)
     if (!s_mtx) {
         return;
     }
-    if (s_live) {
-        return;
-    }
     if (seconds < 0) {
         seconds = 0;
     }
     SDL_LockMutex(s_mtx);
-    s_seek_sec = seconds;
-    s_cmd = CMD_SEEK;
-    SDL_CondSignal(s_cond);
+    if (s_live) {
+        SDL_UnlockMutex(s_mtx);
+        return;
+    }
+    if (s_cmd == CMD_OPEN || !s_have_file) {
+        s_pending_seek = seconds;
+    } else if (s_cmd == CMD_NONE || s_cmd == CMD_SEEK) {
+        s_seek_sec = seconds;
+        s_cmd = CMD_SEEK;
+        SDL_CondSignal(s_cond);
+    }
     SDL_UnlockMutex(s_mtx);
 }
 

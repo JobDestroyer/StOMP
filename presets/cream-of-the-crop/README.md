@@ -4,6 +4,10 @@ Milkdrop "Cream of the Crop" Presets
 Milkdrop "Cream of the Crop" Presets
 This is a huge collection of 9,795 Milkdrop presets, curated and sorted by ISOSCELES.
 
+StOMP ships a pruned copy: presets that strobe (high-frequency `time` oscillators,
+invert flashes, `fDecay` below 0.90, or beat-tied invert/gamma/decay/wave/border)
+were removed to cut photosensitive flashing. The original pack is unchanged upstream.
+
 This set of presets has become the new default package for projectM releases, starting in 2022. All presets are sorted into folders to make is possible to easily select a specific theme of visualizations.
 
 This repository only contains the presets, not the preview images and install instructions and is meant to be included in any projectM-based applications as a preset pack. But if you want the full original package then please download it directly from ISOSCELES:

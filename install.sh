@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: LGPL-2.1-only
+# Copyright (C) 2026 JobDestroyer
 # Install StOMP on a Steam Machine / SteamOS box: binary, Steam library
 # shortcut, and Big Picture / library art.
 #

@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #include "app.h"
 #include "mpris.h"
 #include "radio.h"
@@ -11,6 +15,7 @@
 static int s_page_dir;
 static uint32_t s_page_next_ms;
 static int s_fail_skip;
+static int s_suspend_paused;
 
 void app_play_track(App *app, const LibTrack *t)
 {
@@ -166,7 +171,16 @@ void app_resume_playback(App *app)
 {
     LibTrack t;
     int pos = 0;
+    char title[VIBE_NAME_MAX];
+    char url[VIBE_PATH_MAX];
+    char sub[VIBE_NAME_MAX];
     if (!app) {
+        return;
+    }
+    if (library_resume_radio(title, (int)sizeof(title), url, (int)sizeof(url),
+                             sub, (int)sizeof(sub)) == 0 && url[0]) {
+        app_play_radio(app, title[0] ? title : "Internet Radio", url, sub[0] ? sub : "Internet Radio");
+        ui_set_view(UI_VIEW_NOW_PLAYING);
         return;
     }
     if (library_resume_track(&t, &pos) != 0 || !t.path[0]) {
@@ -202,6 +216,20 @@ void app_stop(App *app)
     mpris_notify();
 }
 
+void app_halt(App *app)
+{
+    decode_stop_file();
+    audio_pause(1);
+    if (app) {
+        app->now_valid = 0;
+        app->playing_radio = 0;
+        app->radio_url[0] = '\0';
+        memset(&app->now, 0, sizeof(app->now));
+        app_persist(app);
+    }
+    mpris_notify();
+}
+
 void app_seek_delta(App *app, double seconds)
 {
     double p = decode_position() + seconds;
@@ -217,13 +245,16 @@ void app_seek_delta(App *app, double seconds)
         p = d;
     }
     decode_seek(p);
+    mpris_notify_seeked();
 }
 
 void app_set_volume_delta(App *app, float d)
 {
     float v = audio_volume() + d;
     audio_set_volume(v);
-    app->cfg.volume = audio_volume();
+    if (app) {
+        app->cfg.volume = audio_volume();
+    }
     mpris_notify();
 }
 
@@ -266,6 +297,9 @@ void app_apply_profile(App *app, int force)
 void app_persist(App *app)
 {
     char buf[32];
+    if (!app) {
+        return;
+    }
     library_session_set_int("volume_milli", (int)(audio_volume() * 1000.f));
     library_session_set_int("shuffle", app->shuffle);
     library_session_set_int("repeat", (int)app->repeat);
@@ -275,9 +309,24 @@ void app_persist(App *app)
     library_session_set_int("last_view", (int)ui_view());
     library_session_set_int("position_ms", (int)(decode_position() * 1000.0));
     library_session_set_int("queue_index", library_queue_index());
-    if (app->now_valid) {
-        snprintf(buf, sizeof(buf), "%lld", (long long)app->now.id);
-        library_session_set("track_id", buf);
+    if (app->playing_radio && app->radio_url[0]) {
+        library_session_set_int("playing_radio", 1);
+        library_session_set("radio_url", app->radio_url);
+        library_session_set("radio_title", app->now.title);
+        library_session_set("radio_sub", app->now.artist);
+        library_session_set("track_id", "");
+    } else {
+        library_session_set_int("playing_radio", 0);
+        library_session_set("radio_url", "");
+        library_session_set("radio_title", "");
+        library_session_set("radio_sub", "");
+        if (app->now_valid && app->now.id > 0) {
+            snprintf(buf, sizeof(buf), "%lld", (long long)app->now.id);
+            library_session_set("track_id", buf);
+        } else {
+            library_session_set("track_id", "");
+            library_session_set_int("position_ms", 0);
+        }
     }
     library_queue_save();
 }
@@ -341,6 +390,7 @@ static void suspend(App *app)
         return;
     }
     fprintf(stderr, "StOMP: suspend\n");
+    s_suspend_paused = audio_paused();
     app_persist(app);
     audio_pause(1);
     decode_pause(1);
@@ -356,8 +406,8 @@ static int resume_app(App *app)
         return 0;
     }
     fprintf(stderr, "StOMP: resume\n");
-    decode_pause(0);
-    audio_pause(0);
+    decode_pause(s_suspend_paused);
+    audio_pause(s_suspend_paused);
     if (plat_recreate_gl() != 0) {
         fprintf(stderr, "StOMP: GL recreate failed; audio continues\n");
         app->suspended = 0;
@@ -371,11 +421,16 @@ static int resume_app(App *app)
         app->viz_retry = 1;
     } else {
         viz_set_shuffle(app->cfg.viz_shuffle);
+        viz_set_lock(library_session_get_int("preset_lock", 0));
+        viz_set_enabled(library_session_get_int("viz_enabled", 1));
+        viz_set_pool((VibeVizPool)library_session_get_int("viz_pool", VIBE_VIZ_POOL_NOT_BAD));
         app->viz_retry = 0;
     }
     if (ui_init(app->win_w, app->win_h, app->profile.veil) != 0) {
         fprintf(stderr, "StOMP: HUD init failed\n");
     }
+    input_init();
+    ui_refresh_lists(app);
     app->suspended = 0;
     return 0;
 }
@@ -546,7 +601,9 @@ int app_run(int argc, char **argv)
             }
             if (ev.type == SDL_TEXTINPUT) {
                 ui_text_input(ev.text.text);
-                ui_refresh_lists(&app);
+                if (ui_view() == UI_VIEW_SEARCH) {
+                    ui_refresh_lists(&app);
+                }
                 ui_note_input(SDL_GetTicks());
                 continue;
             }
@@ -564,7 +621,9 @@ int app_run(int argc, char **argv)
                 continue;
             }
             if (input_process_event(&ev, &cmd) && cmd != VIBE_CMD_NONE) {
-                ui_note_input(SDL_GetTicks());
+                if (cmd != VIBE_CMD_BACK) {
+                    ui_note_input(SDL_GetTicks());
+                }
                 handle_cmd(&app, cmd, 0);
             }
         }

@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #ifndef VIBE_PLATFORM_SDL_H
 #define VIBE_PLATFORM_SDL_H
 

@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #ifndef VIBE_RADIO_H
 #define VIBE_RADIO_H
 

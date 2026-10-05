@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 /* Host tool: stub ELF + payload + trailer -> single-file stomp. */
 #include <dirent.h>
 #include <errno.h>

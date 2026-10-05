@@ -1,8 +1,13 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #include "radio.h"
 
 #include <libavformat/avio.h>
 #include <libavformat/avformat.h>
 #include <libavutil/dict.h>
+#include <libavutil/error.h>
 
 #include <ctype.h>
 #include <stdio.h>
@@ -67,18 +72,33 @@ static int http_get(const char *url, char **out)
             char *nb;
             int ncap = cap * 2;
             if (ncap > 4 * 1024 * 1024) {
-                break;
+                free(buf);
+                avio_closep(&io);
+                return -1;
             }
             nb = (char *)realloc(buf, (size_t)ncap);
             if (!nb) {
-                break;
+                free(buf);
+                avio_closep(&io);
+                return -1;
             }
             buf = nb;
             cap = ncap;
         }
         r = avio_read(io, (unsigned char *)buf + n, cap - n - 1);
-        if (r <= 0) {
+        if (r == AVERROR(EAGAIN)) {
+            continue;
+        }
+        if (r == 0 || r == AVERROR_EOF) {
             break;
+        }
+        if (r < 0) {
+            if (n > 0) {
+                break;
+            }
+            free(buf);
+            avio_closep(&io);
+            return -1;
         }
         n += r;
     }
@@ -86,6 +106,72 @@ static int http_get(const char *url, char **out)
     avio_closep(&io);
     *out = buf;
     return n;
+}
+
+static int js_hexn(int c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+static int js_hex4(const char *s)
+{
+    int v = 0, i;
+    for (i = 0; i < 4; i++) {
+        int h = js_hexn((unsigned char)s[i]);
+        if (h < 0) {
+            return -1;
+        }
+        v = (v << 4) | h;
+    }
+    return v;
+}
+
+static int js_utf8_put(char *out, int o, int outn, unsigned cp)
+{
+    if (cp <= 0x7Fu) {
+        if (o + 1 >= outn) {
+            return -1;
+        }
+        out[o++] = (char)cp;
+        return o;
+    }
+    if (cp <= 0x7FFu) {
+        if (o + 2 >= outn) {
+            return -1;
+        }
+        out[o++] = (char)(0xC0u | (cp >> 6));
+        out[o++] = (char)(0x80u | (cp & 0x3Fu));
+        return o;
+    }
+    if (cp <= 0xFFFFu) {
+        if (o + 3 >= outn) {
+            return -1;
+        }
+        out[o++] = (char)(0xE0u | (cp >> 12));
+        out[o++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[o++] = (char)(0x80u | (cp & 0x3Fu));
+        return o;
+    }
+    if (cp <= 0x10FFFFu) {
+        if (o + 4 >= outn) {
+            return -1;
+        }
+        out[o++] = (char)(0xF0u | (cp >> 18));
+        out[o++] = (char)(0x80u | ((cp >> 12) & 0x3Fu));
+        out[o++] = (char)(0x80u | ((cp >> 6) & 0x3Fu));
+        out[o++] = (char)(0x80u | (cp & 0x3Fu));
+        return o;
+    }
+    return -1;
 }
 
 static int js_unescape(const char *in, int inlen, char *out, int outn)
@@ -104,7 +190,25 @@ static int js_unescape(const char *in, int inlen, char *out, int outn)
                 out[o++] = (c == 'n') ? '\n' : ((c == 't') ? '\t' : '\r');
                 i += 2;
             } else if (c == 'u' && i + 5 < inlen) {
+                int cp = js_hex4(in + i + 2);
+                int nout;
                 i += 6;
+                if (cp < 0) {
+                    continue;
+                }
+                if (cp >= 0xD800 && cp <= 0xDBFF && i + 5 < inlen &&
+                    in[i] == '\\' && in[i + 1] == 'u') {
+                    int lo = js_hex4(in + i + 2);
+                    if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                        cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
+                        i += 6;
+                    }
+                }
+                nout = js_utf8_put(out, o, outn, (unsigned)cp);
+                if (nout < 0) {
+                    break;
+                }
+                o = nout;
             } else {
                 i += 2;
             }

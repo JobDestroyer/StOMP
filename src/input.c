@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #include "input.h"
 
 #include "platform_sdl.h"
@@ -14,6 +18,12 @@ static VibeCmd s_repeat_cmd;
 static int s_confirm_down;
 static uint32_t s_confirm_at;
 static int s_confirm_hold_sent;
+static int s_x_down;
+static uint32_t s_x_at;
+static int s_x_hold_sent;
+static int s_y_down;
+static uint32_t s_y_at;
+static int s_y_hold_sent;
 
 static const int s_default_binds[VIBE_BIND_COUNT] = {
     SDL_CONTROLLER_BUTTON_A,
@@ -54,8 +64,8 @@ static const char *s_bind_keys[VIBE_BIND_COUNT] = {
 static const char *s_bind_names[VIBE_BIND_COUNT] = {
     "Play / confirm",
     "Back / hide HUD",
-    "Add to queue",
-    "Search / queue remove",
+    "Dislike visualization",
+    "Like visualization",
     "Previous track",
     "Next track",
     "Now-playing queue",
@@ -78,6 +88,12 @@ void input_init(void)
     s_confirm_down = 0;
     s_confirm_at = 0;
     s_confirm_hold_sent = 0;
+    s_x_down = 0;
+    s_x_at = 0;
+    s_x_hold_sent = 0;
+    s_y_down = 0;
+    s_y_at = 0;
+    s_y_hold_sent = 0;
 }
 
 void input_reset_repeat(void)
@@ -288,6 +304,32 @@ static VibeCmd button_to_cmd(SDL_GameControllerButton b, int down)
                 }
                 return VIBE_CMD_NONE;
             }
+            if (s_bind_cmds[i] == VIBE_CMD_SEARCH_OR_REMOVE) {
+                if (down) {
+                    s_y_down = 1;
+                    s_y_at = SDL_GetTicks();
+                    s_y_hold_sent = 0;
+                    return VIBE_CMD_NONE;
+                }
+                s_y_down = 0;
+                if (!s_y_hold_sent) {
+                    return VIBE_CMD_SEARCH_OR_REMOVE;
+                }
+                return VIBE_CMD_NONE;
+            }
+            if (s_bind_cmds[i] == VIBE_CMD_QUEUE_ADD) {
+                if (down) {
+                    s_x_down = 1;
+                    s_x_at = SDL_GetTicks();
+                    s_x_hold_sent = 0;
+                    return VIBE_CMD_NONE;
+                }
+                s_x_down = 0;
+                if (!s_x_hold_sent) {
+                    return VIBE_CMD_QUEUE_ADD;
+                }
+                return VIBE_CMD_NONE;
+            }
             return down ? s_bind_cmds[i] : VIBE_CMD_NONE;
         }
     }
@@ -296,11 +338,29 @@ static VibeCmd button_to_cmd(SDL_GameControllerButton b, int down)
 
 static VibeCmd key_to_cmd(SDL_Keycode k, int down)
 {
+    if (SDL_IsTextInputActive() &&
+        (k == SDLK_RETURN || k == SDLK_SPACE || k == SDLK_x || k == SDLK_y)) {
+        return VIBE_CMD_NONE;
+    }
     if (!down) {
         if (k == SDLK_RETURN || k == SDLK_SPACE) {
             s_confirm_down = 0;
             if (!s_confirm_hold_sent) {
                 return VIBE_CMD_CONFIRM_UP;
+            }
+            return VIBE_CMD_NONE;
+        }
+        if (k == SDLK_x) {
+            s_x_down = 0;
+            if (!s_x_hold_sent) {
+                return VIBE_CMD_QUEUE_ADD;
+            }
+            return VIBE_CMD_NONE;
+        }
+        if (k == SDLK_y) {
+            s_y_down = 0;
+            if (!s_y_hold_sent) {
+                return VIBE_CMD_SEARCH_OR_REMOVE;
             }
             return VIBE_CMD_NONE;
         }
@@ -327,15 +387,21 @@ static VibeCmd key_to_cmd(SDL_Keycode k, int down)
         s_confirm_hold_sent = 0;
         return VIBE_CMD_CONFIRM;
     case SDLK_ESCAPE:
-        return VIBE_CMD_BACK;
+        return VIBE_CMD_LIBRARY;
     case SDLK_BACKSPACE:
         return VIBE_CMD_SEARCH_BACKSPACE;
     case SDLK_DELETE:
         return VIBE_CMD_SEARCH_CLEAR;
     case SDLK_x:
-        return VIBE_CMD_QUEUE_ADD;
+        s_x_down = 1;
+        s_x_at = SDL_GetTicks();
+        s_x_hold_sent = 0;
+        return VIBE_CMD_NONE;
     case SDLK_y:
-        return VIBE_CMD_SEARCH_OR_REMOVE;
+        s_y_down = 1;
+        s_y_at = SDL_GetTicks();
+        s_y_hold_sent = 0;
+        return VIBE_CMD_NONE;
     case SDLK_UP:
         s_dup = 1;
         arm_repeat(VIBE_CMD_UP);
@@ -497,6 +563,16 @@ int input_poll_repeat(VibeCmd *out, int *repeat)
     if (s_confirm_down && !s_confirm_hold_sent && now - s_confirm_at >= 500) {
         s_confirm_hold_sent = 1;
         *out = VIBE_CMD_CONFIRM_HOLD;
+        return 1;
+    }
+    if (s_x_down && !s_x_hold_sent && now - s_x_at >= 500) {
+        s_x_hold_sent = 1;
+        *out = VIBE_CMD_QUEUE_ADD_HOLD;
+        return 1;
+    }
+    if (s_y_down && !s_y_hold_sent && now - s_y_at >= 500) {
+        s_y_hold_sent = 1;
+        *out = VIBE_CMD_QUEUE_APPEND;
         return 1;
     }
     sample_left_stick(&stick_rise);

@@ -1,4 +1,9 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #include "library.h"
+#include "playlist.h"
 
 #include "sqlite3.h"
 
@@ -14,21 +19,50 @@
 #include <strings.h>
 
 static sqlite3 *s_db;
+static sqlite3 *s_viz;
 static char s_roots[VIBE_MAX_MUSIC_DIRS][VIBE_PATH_MAX];
 static int s_nroots;
 static int s_cnt_albums = -1;
 static int s_cnt_artists = -1;
 static int s_cnt_folders = -1;
 static int s_scan_writes;
+static int s_scanning;
 
 static void counts_invalidate(void);
 static void scan_checkpoint(void);
 static int album_name_cmp(const void *a, const void *b);
+static int album_year_cmp(const void *a, const void *b);
 static int artist_name_cmp(const void *a, const void *b);
 static int playlist_name_cmp(const void *a, const void *b);
 static int64_t s_queue[VIBE_QUEUE_MAX];
 static int s_qlen;
 static int s_qidx;
+static int64_t s_qhas[VIBE_QUEUE_MAX];
+static int s_qhas_n;
+static int s_qhas_ready;
+
+typedef struct {
+    int64_t id;
+    int queued;
+    int total;
+} QueueCover;
+static QueueCover s_cover_alb[VIBE_QUEUE_MAX];
+static int s_cover_nalb;
+static QueueCover s_cover_art[VIBE_QUEUE_MAX];
+static int s_cover_nart;
+static QueueCover s_cover_pl[VIBE_QUEUE_MAX];
+static int s_cover_npl;
+static char s_cover_path[VIBE_QUEUE_MAX][VIBE_PATH_MAX];
+static int s_cover_npath;
+static QueueCover s_cover_fold[VIBE_QUEUE_MAX];
+static int s_cover_nfold;
+static int s_cover_ready;
+
+static void queue_mutated(void)
+{
+    s_cover_ready = 0;
+    s_qhas_ready = 0;
+}
 
 static const char *k_schema =
     "PRAGMA journal_mode=WAL;"
@@ -45,6 +79,7 @@ static const char *k_schema =
     "  id INTEGER PRIMARY KEY,"
     "  artist_id INTEGER,"
     "  name TEXT NOT NULL COLLATE NOCASE,"
+    "  year INTEGER,"
     "  UNIQUE(name)"
     ");"
     "CREATE TABLE IF NOT EXISTS tracks ("
@@ -64,7 +99,8 @@ static const char *k_schema =
     "CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id);"
     "CREATE TABLE IF NOT EXISTS playlists ("
     "  id INTEGER PRIMARY KEY,"
-    "  name TEXT NOT NULL"
+    "  name TEXT NOT NULL,"
+    "  path TEXT UNIQUE"
     ");"
     "CREATE TABLE IF NOT EXISTS playlist_items ("
     "  id INTEGER PRIMARY KEY,"
@@ -94,6 +130,15 @@ static const char *k_schema =
     "  name TEXT NOT NULL,"
     "  url TEXT NOT NULL UNIQUE,"
     "  sub TEXT"
+    ");"
+    "CREATE TABLE IF NOT EXISTS artist_fav ("
+    "  artist_id INTEGER PRIMARY KEY"
+    ");"
+    "CREATE TABLE IF NOT EXISTS album_fav ("
+    "  album_id INTEGER PRIMARY KEY"
+    ");"
+    "CREATE TABLE IF NOT EXISTS playlist_fav ("
+    "  path TEXT PRIMARY KEY"
     ");";
 
 static int is_audio_ext(const char *name)
@@ -243,7 +288,8 @@ static int64_t get_or_create_folder(const char *path, int64_t parent_id)
     sqlite3_stmt *st = NULL;
     int64_t id = 0;
     if (sqlite3_prepare_v2(s_db,
-                           "INSERT OR IGNORE INTO folders(path, parent_id) VALUES(?1,?2);",
+                           "INSERT INTO folders(path, parent_id) VALUES(?1,?2) "
+                           "ON CONFLICT(path) DO UPDATE SET parent_id=excluded.parent_id;",
                            -1, &st, NULL) != SQLITE_OK) {
         return 0;
     }
@@ -309,6 +355,7 @@ static void fill_album_from_row(sqlite3_stmt *st, LibAlbum *a)
     }
     a->artist_id = sqlite3_column_int64(st, 3);
     a->track_count = sqlite3_column_int(st, 4);
+    a->year = sqlite3_column_int(st, 5);
 }
 
 static const char *k_track_select =
@@ -323,7 +370,8 @@ static const char *k_album_from =
     "CASE WHEN COUNT(DISTINCT t.artist_id) > 1 THEN 'Various Artists' "
     "ELSE IFNULL(MAX(a.name), '') END, "
     "IFNULL(MIN(t.artist_id), 0), "
-    "COUNT(t.id) "
+    "COUNT(t.id), "
+    "IFNULL(b.year, 0) "
     "FROM albums b "
     "LEFT JOIN tracks t ON t.album_id=b.id "
     "LEFT JOIN artists a ON a.id=t.artist_id ";
@@ -364,6 +412,25 @@ int library_read_tags(const char *path, LibTrack *out)
     e = av_dict_get(fmt->metadata, "track", NULL, 0);
     if (e && e->value) {
         out->track_no = atoi(e->value);
+    }
+    {
+        static const char *keys[] = {"date", "year", "DATE", "YEAR", "TDRC", "TDRL", "TYER", NULL};
+        int k;
+        for (k = 0; keys[k] && out->year <= 0; k++) {
+            int y = 0;
+            const char *s;
+            e = av_dict_get(fmt->metadata, keys[k], NULL, 0);
+            if (!e || !e->value) {
+                continue;
+            }
+            s = e->value;
+            while (*s && (*s < '0' || *s > '9')) {
+                s++;
+            }
+            if (sscanf(s, "%d", &y) == 1 && y >= 1000 && y <= 2100) {
+                out->year = y;
+            }
+        }
     }
     if (fmt->duration > 0) {
         out->duration_ms = (int)(fmt->duration / 1000);
@@ -424,6 +491,17 @@ static void upsert_track(const char *path, time_t mtime, int64_t folder_id)
     }
     artist_id = get_or_create_artist(t.artist);
     album_id = get_or_create_album(t.album);
+    if (t.year > 0 && album_id > 0) {
+        sqlite3_stmt *yst = NULL;
+        if (sqlite3_prepare_v2(s_db,
+                               "UPDATE albums SET year=?1 WHERE id=?2 AND IFNULL(year,0)=0;",
+                               -1, &yst, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(yst, 1, t.year);
+            sqlite3_bind_int64(yst, 2, album_id);
+            sqlite3_step(yst);
+            sqlite3_finalize(yst);
+        }
+    }
     if (folder_id <= 0) {
         folder_id = get_or_create_folder(dir, 0);
     }
@@ -490,6 +568,499 @@ static void walk_dir(const char *path, int64_t parent_id, int depth)
     closedir(d);
 }
 
+static void path_dirname_copy(const char *path, char *out, int n)
+{
+    const char *slash;
+    if (!out || n <= 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!path) {
+        return;
+    }
+    slash = strrchr(path, '/');
+    if (!slash) {
+        snprintf(out, (size_t)n, ".");
+        return;
+    }
+    if (slash == path) {
+        snprintf(out, (size_t)n, "/");
+        return;
+    }
+    {
+        size_t L = (size_t)(slash - path);
+        if (L >= (size_t)n) {
+            L = (size_t)n - 1;
+        }
+        memcpy(out, path, L);
+        out[L] = '\0';
+    }
+}
+
+static void path_basename_copy(const char *path, char *out, int n)
+{
+    const char *slash;
+    if (!out || n <= 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!path || !path[0]) {
+        return;
+    }
+    slash = strrchr(path, '/');
+    snprintf(out, (size_t)n, "%s", slash ? slash + 1 : path);
+}
+
+static void path_join_norm(const char *dir, const char *rel, char *out, int n)
+{
+    char tmp[VIBE_PATH_MAX];
+    char *parts[128];
+    char store[VIBE_PATH_MAX];
+    int np = 0, abs = 0, i;
+    size_t used = 0;
+    if (!out || n <= 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!rel || !rel[0]) {
+        return;
+    }
+    if (rel[0] == '/' || (isalpha((unsigned char)rel[0]) && rel[1] == ':')) {
+        snprintf(tmp, sizeof(tmp), "%s", rel);
+    } else if (dir && dir[0]) {
+        snprintf(tmp, sizeof(tmp), "%s/%s", dir, rel);
+    } else {
+        snprintf(tmp, sizeof(tmp), "%s", rel);
+    }
+    abs = tmp[0] == '/';
+    store[0] = '\0';
+    {
+        char *p = tmp;
+        while (*p) {
+            char *start;
+            size_t L;
+            while (*p == '/') {
+                p++;
+            }
+            if (!*p) {
+                break;
+            }
+            start = p;
+            while (*p && *p != '/') {
+                p++;
+            }
+            L = (size_t)(p - start);
+            if (L == 1 && start[0] == '.') {
+                continue;
+            }
+            if (L == 2 && start[0] == '.' && start[1] == '.') {
+                if (np > 0) {
+                    np--;
+                }
+                continue;
+            }
+            if (np < 128 && used + L + 1 < sizeof(store)) {
+                parts[np] = store + used;
+                memcpy(store + used, start, L);
+                store[used + L] = '\0';
+                used += L + 1;
+                np++;
+            }
+        }
+    }
+    if (abs) {
+        snprintf(out, (size_t)n, "/");
+    } else {
+        out[0] = '\0';
+    }
+    for (i = 0; i < np; i++) {
+        size_t have = strlen(out);
+        if (have && out[have - 1] != '/') {
+            snprintf(out + have, (size_t)n - have, "/%s", parts[i]);
+        } else {
+            snprintf(out + have, (size_t)n - have, "%s", parts[i]);
+        }
+    }
+}
+
+static int64_t track_id_by_path(const char *path)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t id = 0;
+    if (!s_db || !path || !path[0]) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "SELECT id FROM tracks WHERE path=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        id = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return id;
+}
+
+static void like_escape(const char *in, char *out, size_t cap)
+{
+    size_t j = 0;
+    const char *p;
+    if (!out || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!in) {
+        return;
+    }
+    for (p = in; *p && j + 2 < cap; p++) {
+        if (*p == '%' || *p == '_' || *p == '\\') {
+            out[j++] = '\\';
+        }
+        out[j++] = *p;
+    }
+    out[j] = '\0';
+}
+
+static int64_t track_id_by_basename(const char *base, const char *pl_dir)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t best = 0, fallback = 0;
+    size_t pld = pl_dir ? strlen(pl_dir) : 0;
+    char pat[VIBE_PATH_MAX];
+    if (!s_db || !base || !base[0]) {
+        return 0;
+    }
+    like_escape(base, pat, sizeof(pat));
+    if (sqlite3_prepare_v2(s_db,
+                           "SELECT id, path FROM tracks WHERE lower(path) LIKE '%/' || lower(?1) ESCAPE '\\' "
+                           "OR lower(path) = lower(?2);",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(st, 1, pat, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, base, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        int64_t id = sqlite3_column_int64(st, 0);
+        const unsigned char *p = sqlite3_column_text(st, 1);
+        const char *path = p ? (const char *)p : "";
+        if (!fallback) {
+            fallback = id;
+        }
+        if (pld > 0 && strncmp(path, pl_dir, pld) == 0 &&
+            (path[pld] == '\0' || path[pld] == '/')) {
+            best = id;
+            break;
+        }
+    }
+    sqlite3_finalize(st);
+    return best ? best : fallback;
+}
+
+static int64_t track_id_by_title(const char *title, const char *artist)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t id = 0;
+    if (!s_db || !title || !title[0]) {
+        return 0;
+    }
+    if (artist && artist[0]) {
+        if (sqlite3_prepare_v2(s_db,
+                               "SELECT t.id FROM tracks t LEFT JOIN artists a ON a.id=t.artist_id "
+                               "WHERE t.title=?1 COLLATE NOCASE AND a.name=?2 COLLATE NOCASE LIMIT 1;",
+                               -1, &st, NULL) != SQLITE_OK) {
+            return 0;
+        }
+        sqlite3_bind_text(st, 1, title, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, artist, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            id = sqlite3_column_int64(st, 0);
+        }
+        sqlite3_finalize(st);
+        if (id) {
+            return id;
+        }
+    }
+    if (sqlite3_prepare_v2(s_db,
+                           "SELECT id FROM tracks WHERE title=?1 COLLATE NOCASE LIMIT 1;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(st, 1, title, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        id = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return id;
+}
+
+static int64_t resolve_pl_entry(const char *pl_dir, const PlEntry *e)
+{
+    char full[VIBE_PATH_MAX];
+    char base[VIBE_PATH_MAX];
+    int64_t id;
+    struct stat st;
+    if (!e) {
+        return 0;
+    }
+    full[0] = '\0';
+    if (e->path[0] && !(isalpha((unsigned char)e->path[0]) && e->path[1] == ':')) {
+        path_join_norm(pl_dir, e->path, full, (int)sizeof(full));
+        id = track_id_by_path(full);
+        if (id) {
+            return id;
+        }
+        if (full[0] && stat(full, &st) == 0 && S_ISREG(st.st_mode) && is_audio_ext(full)) {
+            upsert_track(full, st.st_mtime, 0);
+            id = track_id_by_path(full);
+            if (id) {
+                return id;
+            }
+        }
+        id = track_id_by_path(e->path);
+        if (id) {
+            return id;
+        }
+    }
+    path_basename_copy(e->path[0] ? e->path : "", base, (int)sizeof(base));
+    if (base[0]) {
+        id = track_id_by_basename(base, pl_dir);
+        if (id) {
+            return id;
+        }
+    }
+    return track_id_by_title(e->title, e->artist);
+}
+
+static void playlist_display_name(const char *path, char *out, int n)
+{
+    char base[VIBE_NAME_MAX];
+    char *dot;
+    path_basename_copy(path, base, (int)sizeof(base));
+    dot = strrchr(base, '.');
+    if (dot && dot != base) {
+        *dot = '\0';
+    }
+    snprintf(out, (size_t)n, "%s", base[0] ? base : "Playlist");
+}
+
+static void import_playlist_file(const char *path)
+{
+    PlEntry *ents;
+    int n, i, pos;
+    int64_t pl_id = 0;
+    char dir[VIBE_PATH_MAX];
+    char name[VIBE_NAME_MAX];
+    sqlite3_stmt *st = NULL;
+    if (!path || !s_db) {
+        return;
+    }
+    ents = calloc((size_t)VIBE_LIST_MAX, sizeof(*ents));
+    if (!ents) {
+        return;
+    }
+    n = playlist_parse(path, ents, VIBE_LIST_MAX);
+    path_dirname_copy(path, dir, (int)sizeof(dir));
+    playlist_display_name(path, name, (int)sizeof(name));
+    if (sqlite3_prepare_v2(s_db,
+                           "INSERT INTO playlists(name, path) VALUES(?1,?2) "
+                           "ON CONFLICT(path) DO UPDATE SET name=excluded.name;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        free(ents);
+        return;
+    }
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, path, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE) {
+        sqlite3_finalize(st);
+        free(ents);
+        return;
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_prepare_v2(s_db, "SELECT id FROM playlists WHERE path=?1;", -1, &st, NULL) != SQLITE_OK) {
+        free(ents);
+        return;
+    }
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        pl_id = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (pl_id <= 0) {
+        free(ents);
+        return;
+    }
+    if (sqlite3_prepare_v2(s_db, "DELETE FROM playlist_items WHERE playlist_id=?1;", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, pl_id);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+    pos = 0;
+    if (sqlite3_prepare_v2(s_db,
+                           "INSERT INTO playlist_items(playlist_id, track_id, pos) VALUES(?1,?2,?3);",
+                           -1, &st, NULL) != SQLITE_OK) {
+        free(ents);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        int64_t tid = resolve_pl_entry(dir, &ents[i]);
+        if (tid <= 0) {
+            continue;
+        }
+        sqlite3_reset(st);
+        sqlite3_clear_bindings(st);
+        sqlite3_bind_int64(st, 1, pl_id);
+        sqlite3_bind_int64(st, 2, tid);
+        sqlite3_bind_int(st, 3, pos++);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    free(ents);
+    scan_checkpoint();
+}
+
+static void walk_playlists(const char *path, int depth)
+{
+    DIR *d;
+    struct dirent *de;
+    char child[VIBE_PATH_MAX];
+    struct stat st;
+    if (depth > 16) {
+        return;
+    }
+    d = opendir(path);
+    if (!d) {
+        return;
+    }
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') {
+            continue;
+        }
+        snprintf(child, sizeof(child), "%s/%s", path, de->d_name);
+        if (lstat(child, &st) != 0) {
+            continue;
+        }
+        if (S_ISLNK(st.st_mode)) {
+            continue;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            walk_playlists(child, depth + 1);
+        } else if (S_ISREG(st.st_mode) && playlist_is_ext(de->d_name)) {
+            import_playlist_file(child);
+        }
+    }
+    closedir(d);
+}
+
+static void viz_path_from_library(const char *db_path, char *out, size_t n)
+{
+    const char *slash;
+    if (!out || n == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!db_path || !db_path[0]) {
+        snprintf(out, n, "viz.db");
+        return;
+    }
+    slash = strrchr(db_path, '/');
+    if (slash) {
+        snprintf(out, n, "%.*s/viz.db", (int)(slash - db_path), db_path);
+    } else {
+        snprintf(out, n, "viz.db");
+    }
+}
+
+static int viz_row_count(sqlite3 *db)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!db) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM viz_ratings;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+static void viz_migrate_from_library(void)
+{
+    sqlite3_stmt *sel = NULL;
+    sqlite3_stmt *ins = NULL;
+    int n = 0;
+    if (!s_db || !s_viz) {
+        return;
+    }
+    if (viz_row_count(s_viz) > 0 || viz_row_count(s_db) <= 0) {
+        return;
+    }
+    if (sqlite3_prepare_v2(s_db, "SELECT key, rating FROM viz_ratings;", -1, &sel, NULL) != SQLITE_OK) {
+        return;
+    }
+    if (sqlite3_prepare_v2(s_viz,
+                           "INSERT OR REPLACE INTO viz_ratings(key,rating) VALUES(?1,?2);",
+                           -1, &ins, NULL) != SQLITE_OK) {
+        sqlite3_finalize(sel);
+        return;
+    }
+    sqlite3_exec(s_viz, "BEGIN;", NULL, NULL, NULL);
+    while (sqlite3_step(sel) == SQLITE_ROW) {
+        const unsigned char *k = sqlite3_column_text(sel, 0);
+        if (!k || !k[0]) {
+            continue;
+        }
+        sqlite3_reset(ins);
+        sqlite3_bind_text(ins, 1, (const char *)k, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(ins, 2, sqlite3_column_int(sel, 1));
+        if (sqlite3_step(ins) == SQLITE_DONE) {
+            n++;
+        }
+    }
+    sqlite3_exec(s_viz, "COMMIT;", NULL, NULL, NULL);
+    sqlite3_finalize(ins);
+    sqlite3_finalize(sel);
+    if (n > 0) {
+        fprintf(stderr, "StOMP: copied %d visualization ratings into viz.db\n", n);
+    }
+}
+
+static int viz_open(const char *db_path)
+{
+    char path[VIBE_PATH_MAX];
+    char *err = NULL;
+    static const char *schema =
+        "PRAGMA journal_mode=WAL;"
+        "CREATE TABLE IF NOT EXISTS viz_ratings ("
+        "  key TEXT PRIMARY KEY,"
+        "  rating INTEGER NOT NULL"
+        ");";
+    viz_path_from_library(db_path, path, sizeof(path));
+    if (sqlite3_open(path, &s_viz) != SQLITE_OK) {
+        fprintf(stderr, "StOMP: sqlite open %s: %s\n", path, sqlite3_errmsg(s_viz));
+        sqlite3_close(s_viz);
+        s_viz = NULL;
+        return -1;
+    }
+    if (sqlite3_exec(s_viz, schema, NULL, NULL, &err) != SQLITE_OK) {
+        fprintf(stderr, "StOMP: viz schema: %s\n", err ? err : "");
+        sqlite3_free(err);
+        sqlite3_close(s_viz);
+        s_viz = NULL;
+        return -1;
+    }
+    sqlite3_busy_timeout(s_viz, 5000);
+    sqlite3_exec(s_viz, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+    sqlite3_exec(s_viz, "PRAGMA temp_store=MEMORY;", NULL, NULL, NULL);
+    viz_migrate_from_library();
+    fprintf(stderr, "StOMP: visualization ratings %s (%d)\n", path, viz_row_count(s_viz));
+    return 0;
+}
+
 int library_open(const char *db_path)
 {
     char *err = NULL;
@@ -506,9 +1077,16 @@ int library_open(const char *db_path)
         s_db = NULL;
         return -1;
     }
+    sqlite3_exec(s_db, "ALTER TABLE playlists ADD COLUMN path TEXT;", NULL, NULL, NULL);
+    sqlite3_exec(s_db, "ALTER TABLE albums ADD COLUMN year INTEGER;", NULL, NULL, NULL);
+    sqlite3_exec(s_db, "CREATE UNIQUE INDEX IF NOT EXISTS idx_playlists_path ON playlists(path);",
+                 NULL, NULL, NULL);
     sqlite3_busy_timeout(s_db, 5000);
     sqlite3_exec(s_db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
     sqlite3_exec(s_db, "PRAGMA temp_store=MEMORY;", NULL, NULL, NULL);
+    if (viz_open(db_path) != 0) {
+        fprintf(stderr, "StOMP: visualization ratings will not persist this run\n");
+    }
     s_qlen = 0;
     s_qidx = 0;
     s_cnt_albums = s_cnt_artists = s_cnt_folders = -1;
@@ -522,6 +1100,9 @@ static void counts_invalidate(void)
 
 static void scan_checkpoint(void)
 {
+    if (!s_scanning) {
+        return;
+    }
     if (++s_scan_writes < 256) {
         return;
     }
@@ -532,6 +1113,10 @@ static void scan_checkpoint(void)
 
 void library_close(void)
 {
+    if (s_viz) {
+        sqlite3_close(s_viz);
+        s_viz = NULL;
+    }
     if (s_db) {
         sqlite3_close(s_db);
         s_db = NULL;
@@ -586,6 +1171,7 @@ int library_scan(void)
     }
     counts_invalidate();
     s_scan_writes = 0;
+    s_scanning = 1;
     sqlite3_exec(s_db, "BEGIN;", NULL, NULL, NULL);
     for (int i = 0; i < s_nroots; i++) {
         walk_dir(s_roots[i], 0, 0);
@@ -595,7 +1181,12 @@ int library_scan(void)
         int nids = 0, cap = 0, k;
         while (sqlite3_step(st) == SQLITE_ROW) {
             const char *path = (const char *)sqlite3_column_text(st, 1);
-            if (!path_in_roots(path)) {
+            struct stat pst;
+            int gone = !path || !path_in_roots(path);
+            if (!gone && (stat(path, &pst) != 0 || !S_ISREG(pst.st_mode))) {
+                gone = 1;
+            }
+            if (gone) {
                 if (nids >= cap) {
                     int ncap = cap ? cap * 2 : 64;
                     int64_t *grow = realloc(ids, (size_t)ncap * sizeof(*ids));
@@ -629,6 +1220,17 @@ int library_scan(void)
     if (del) {
         sqlite3_finalize(del);
     }
+    sqlite3_exec(s_db, "DELETE FROM playlist_items WHERE playlist_id IN "
+                       "(SELECT id FROM playlists WHERE path IS NOT NULL AND path != '');",
+                 NULL, NULL, NULL);
+    sqlite3_exec(s_db, "DELETE FROM playlists WHERE path IS NOT NULL AND path != '';",
+                 NULL, NULL, NULL);
+    for (int i = 0; i < s_nroots; i++) {
+        walk_playlists(s_roots[i], 0);
+    }
+    sqlite3_exec(s_db, "DELETE FROM playlist_fav WHERE path NOT IN "
+                       "(SELECT path FROM playlists WHERE path IS NOT NULL AND path != '');",
+                 NULL, NULL, NULL);
     sqlite3_exec(s_db, "DELETE FROM playlist_items WHERE track_id NOT IN (SELECT id FROM tracks);",
                  NULL, NULL, NULL);
     sqlite3_exec(s_db, "DELETE FROM last_queue WHERE track_id NOT IN (SELECT id FROM tracks);",
@@ -637,10 +1239,50 @@ int library_scan(void)
                  NULL, NULL, NULL);
     sqlite3_exec(s_db, "DELETE FROM artists WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.artist_id = artists.id);",
                  NULL, NULL, NULL);
+    if (sqlite3_prepare_v2(s_db, "SELECT id, path FROM folders;", -1, &st, NULL) == SQLITE_OK) {
+        int64_t *ids = NULL;
+        int nids = 0, cap = 0, k;
+        sqlite3_stmt *fdel = NULL;
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *path = (const char *)sqlite3_column_text(st, 1);
+            struct stat pst;
+            int gone = !path || !path_in_roots(path);
+            if (!gone && (stat(path, &pst) != 0 || !S_ISDIR(pst.st_mode))) {
+                gone = 1;
+            }
+            if (gone) {
+                if (nids >= cap) {
+                    int ncap = cap ? cap * 2 : 64;
+                    int64_t *grow = realloc(ids, (size_t)ncap * sizeof(*ids));
+                    if (!grow) {
+                        break;
+                    }
+                    ids = grow;
+                    cap = ncap;
+                }
+                ids[nids++] = sqlite3_column_int64(st, 0);
+            }
+        }
+        sqlite3_finalize(st);
+        st = NULL;
+        if (nids > 0 &&
+            sqlite3_prepare_v2(s_db, "DELETE FROM folders WHERE id=?1;", -1, &fdel, NULL) == SQLITE_OK) {
+            for (k = 0; k < nids; k++) {
+                sqlite3_reset(fdel);
+                sqlite3_clear_bindings(fdel);
+                sqlite3_bind_int64(fdel, 1, ids[k]);
+                sqlite3_step(fdel);
+            }
+            sqlite3_finalize(fdel);
+        }
+        free(ids);
+    }
     sqlite3_exec(s_db, "COMMIT;", NULL, NULL, NULL);
+    s_scanning = 0;
+    s_scan_writes = 0;
     counts_invalidate();
-    fprintf(stderr, "StOMP: library has %d tracks in %d albums\n",
-            library_track_count(), library_album_count());
+    fprintf(stderr, "StOMP: library has %d tracks in %d albums, %d playlists\n",
+            library_track_count(), library_album_count(), library_playlist_count());
     return 0;
 }
 
@@ -822,6 +1464,24 @@ static int album_name_cmp(const void *a, const void *b)
     return name_sort_cmp(skip_article(aa->name), skip_article(ab->name));
 }
 
+static int album_year_cmp(const void *a, const void *b)
+{
+    const LibAlbum *aa = a;
+    const LibAlbum *ab = b;
+    int ya = aa->year;
+    int yb = ab->year;
+    if (ya > 0 && yb > 0 && ya != yb) {
+        return ya - yb;
+    }
+    if (ya > 0 && yb <= 0) {
+        return -1;
+    }
+    if (ya <= 0 && yb > 0) {
+        return 1;
+    }
+    return name_sort_cmp(skip_article(aa->name), skip_article(ab->name));
+}
+
 static int artist_name_cmp(const void *a, const void *b)
 {
     const LibArtist *aa = a;
@@ -934,6 +1594,23 @@ int library_list_folders(int64_t parent_id, LibFolder *out, int cap)
     return n;
 }
 
+int library_playlist_count(void)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!s_db) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "SELECT COUNT(*) FROM playlists;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
 int library_list_playlists(LibPlaylist *out, int cap)
 {
     sqlite3_stmt *st = NULL;
@@ -988,7 +1665,10 @@ static int list_tracks_sql(const char *sql, int64_t id, LibTrack *out, int cap)
 int library_album_tracks(int64_t album_id, LibTrack *out, int cap)
 {
     char sql[768];
-    snprintf(sql, sizeof(sql), "%s WHERE t.album_id=?1 ORDER BY t.track_no, t.title LIMIT %d;", k_track_select, cap);
+    snprintf(sql, sizeof(sql),
+             "%s WHERE t.album_id=?1 ORDER BY CASE WHEN IFNULL(t.track_no,0)=0 THEN 1 ELSE 0 END, "
+             "IFNULL(t.track_no,0), t.title COLLATE NOCASE LIMIT %d;",
+             k_track_select, cap);
     return list_tracks_sql(sql, album_id, out, cap);
 }
 
@@ -1002,7 +1682,8 @@ int library_artist_albums(int64_t artist_id, LibAlbum *out, int cap)
     }
     snprintf(sql, sizeof(sql),
              "%s WHERE b.id IN (SELECT album_id FROM tracks WHERE artist_id=?1) "
-             "GROUP BY b.id ORDER BY b.name COLLATE NOCASE LIMIT ?2;",
+             "GROUP BY b.id ORDER BY CASE WHEN IFNULL(b.year,0)=0 THEN 1 ELSE 0 END, "
+             "IFNULL(b.year,0), b.name COLLATE NOCASE LIMIT ?2;",
              k_album_from);
     if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
         return 0;
@@ -1015,7 +1696,7 @@ int library_artist_albums(int64_t artist_id, LibAlbum *out, int cap)
     }
     sqlite3_finalize(st);
     if (n > 1) {
-        qsort(out, (size_t)n, sizeof(out[0]), album_name_cmp);
+        qsort(out, (size_t)n, sizeof(out[0]), album_year_cmp);
     }
     return n;
 }
@@ -1031,7 +1712,7 @@ int library_folder_tracks(int64_t folder_id, LibTrack *out, int cap)
     snprintf(sql, sizeof(sql),
              "%s JOIN folders f ON f.id=?1 "
              "WHERE t.path = f.path OR substr(t.path, 1, length(f.path)+1) = f.path || '/' "
-             "ORDER BY t.title COLLATE NOCASE LIMIT %d;",
+             "ORDER BY t.path COLLATE NOCASE LIMIT %d;",
              k_track_select, cap);
     if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
         return 0;
@@ -1055,13 +1736,13 @@ int library_folder_direct_tracks(int64_t folder_id, LibTrack *out, int cap)
     }
     if (folder_id > 0) {
         snprintf(sql, sizeof(sql),
-                 "%s WHERE t.folder_id=?1 ORDER BY t.title COLLATE NOCASE LIMIT %d;",
+                 "%s WHERE t.folder_id=?1 ORDER BY t.path COLLATE NOCASE LIMIT %d;",
                  k_track_select, cap);
         return list_tracks_sql(sql, folder_id, out, cap);
     }
     snprintf(sql, sizeof(sql),
              "%s JOIN folders f ON f.id=t.folder_id WHERE f.parent_id IS NULL "
-             "ORDER BY t.title COLLATE NOCASE LIMIT %d;",
+             "ORDER BY t.path COLLATE NOCASE LIMIT %d;",
              k_track_select, cap);
     if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
         return 0;
@@ -1124,14 +1805,26 @@ int library_search(const char *query, LibTrack *out, int cap)
 {
     sqlite3_stmt *st = NULL;
     int n = 0;
-    char like[VIBE_NAME_MAX + 8];
+    char like[VIBE_NAME_MAX * 2 + 8];
     char sql[768];
+    size_t j;
+    const char *q;
     if (!s_db || !out || cap <= 0 || !query) {
         return 0;
     }
-    snprintf(like, sizeof(like), "%%%s%%", query);
+    like[0] = '%';
+    j = 1;
+    for (q = query; *q && j + 3 < sizeof(like); q++) {
+        if (*q == '%' || *q == '_' || *q == '\\') {
+            like[j++] = '\\';
+        }
+        like[j++] = *q;
+    }
+    like[j++] = '%';
+    like[j] = '\0';
     snprintf(sql, sizeof(sql),
-             "%s WHERE t.title LIKE ?1 OR a.name LIKE ?1 OR b.name LIKE ?1 "
+             "%s WHERE t.title LIKE ?1 ESCAPE '\\' OR a.name LIKE ?1 ESCAPE '\\' "
+             "OR b.name LIKE ?1 ESCAPE '\\' "
              "ORDER BY t.title LIMIT %d;",
              k_track_select, cap);
     if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
@@ -1178,6 +1871,9 @@ int library_resume_track(LibTrack *out, int *position_ms)
 {
     char buf[32];
     int64_t id;
+    if (library_session_get_int("playing_radio", 0)) {
+        return -1;
+    }
     if (position_ms) {
         *position_ms = library_session_get_int("position_ms", 0);
     }
@@ -1185,7 +1881,33 @@ int library_resume_track(LibTrack *out, int *position_ms)
         return -1;
     }
     id = (int64_t)atoll(buf);
+    if (id <= 0) {
+        return -1;
+    }
     return library_get_track(id, out);
+}
+
+int library_resume_radio(char *title, int title_n, char *url, int url_n, char *sub, int sub_n)
+{
+    if (!title || title_n <= 0 || !url || url_n <= 0) {
+        return -1;
+    }
+    title[0] = '\0';
+    url[0] = '\0';
+    if (sub && sub_n > 0) {
+        sub[0] = '\0';
+    }
+    if (library_session_get_int("playing_radio", 0) == 0) {
+        return -1;
+    }
+    if (library_session_get("radio_url", url, url_n) != 0 || !url[0]) {
+        return -1;
+    }
+    library_session_get("radio_title", title, title_n);
+    if (sub && sub_n > 0) {
+        library_session_get("radio_sub", sub, sub_n);
+    }
+    return 0;
 }
 
 int library_queue_len(void)
@@ -1227,6 +1949,7 @@ int library_queue_add(int64_t track_id)
         return -1;
     }
     s_queue[s_qlen++] = track_id;
+    queue_mutated();
     return 0;
 }
 
@@ -1243,19 +1966,30 @@ static int add_tracks_sql(const char *sql, int64_t id)
         n++;
     }
     sqlite3_finalize(st);
+    if (n > 0) {
+        queue_mutated();
+    }
     return n;
 }
 
 int library_queue_add_album(int64_t album_id)
 {
-    return add_tracks_sql("SELECT id FROM tracks WHERE album_id=?1 ORDER BY track_no, title;", album_id);
+    return add_tracks_sql(
+        "SELECT id FROM tracks WHERE album_id=?1 "
+        "ORDER BY CASE WHEN IFNULL(track_no,0)=0 THEN 1 ELSE 0 END, IFNULL(track_no,0), title COLLATE NOCASE;",
+        album_id);
 }
 
 int library_queue_add_artist(int64_t artist_id)
 {
-    return add_tracks_sql("SELECT t.id FROM tracks t JOIN albums b ON b.id=t.album_id "
-                          "WHERE t.artist_id=?1 ORDER BY b.name, t.track_no, t.title;",
-                          artist_id);
+    return add_tracks_sql(
+        "SELECT t.id FROM tracks t JOIN albums b ON b.id=t.album_id "
+        "WHERE t.artist_id=?1 "
+        "ORDER BY CASE WHEN IFNULL(b.year,0)=0 THEN 1 ELSE 0 END, IFNULL(b.year,0), "
+        "b.name COLLATE NOCASE, "
+        "CASE WHEN IFNULL(t.track_no,0)=0 THEN 1 ELSE 0 END, IFNULL(t.track_no,0), "
+        "t.title COLLATE NOCASE;",
+        artist_id);
 }
 
 int library_queue_add_folder(int64_t folder_id)
@@ -1263,63 +1997,355 @@ int library_queue_add_folder(int64_t folder_id)
     return add_tracks_sql(
         "SELECT t.id FROM tracks t JOIN folders f ON f.id=?1 "
         "WHERE t.path = f.path OR substr(t.path, 1, length(f.path)+1) = f.path || '/' "
-        "ORDER BY t.title COLLATE NOCASE;",
+        "ORDER BY t.path COLLATE NOCASE;",
         folder_id);
+}
+
+int library_queue_add_playlist(int64_t playlist_id)
+{
+    return add_tracks_sql(
+        "SELECT track_id FROM playlist_items WHERE playlist_id=?1 ORDER BY pos;",
+        playlist_id);
+}
+
+static int play_from_sql(const char *sql, int64_t id, int64_t start_track_id)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t tmp[VIBE_QUEUE_MAX];
+    int n = 0, started = 0;
+    if (!s_db || !sql) {
+        return -1;
+    }
+    if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, id);
+    while (sqlite3_step(st) == SQLITE_ROW && n < VIBE_QUEUE_MAX) {
+        int64_t tid = sqlite3_column_int64(st, 0);
+        if (!started && start_track_id != 0 && tid != start_track_id) {
+            continue;
+        }
+        started = 1;
+        tmp[n++] = tid;
+    }
+    sqlite3_finalize(st);
+    if (n <= 0) {
+        return -1;
+    }
+    memcpy(s_queue, tmp, (size_t)n * sizeof(tmp[0]));
+    s_qlen = n;
+    s_qidx = 0;
+    queue_mutated();
+    return 0;
 }
 
 int library_queue_play_album_from(int64_t album_id, int64_t start_track_id)
 {
-    sqlite3_stmt *st = NULL;
-    int started = 0;
-    s_qlen = 0;
-    s_qidx = 0;
-    if (sqlite3_prepare_v2(s_db,
-                           "SELECT id FROM tracks WHERE album_id=?1 ORDER BY track_no, title;",
-                           -1, &st, NULL) != SQLITE_OK) {
-        return -1;
-    }
-    sqlite3_bind_int64(st, 1, album_id);
-    while (sqlite3_step(st) == SQLITE_ROW && s_qlen < VIBE_QUEUE_MAX) {
-        int64_t id = sqlite3_column_int64(st, 0);
-        if (!started && start_track_id != 0 && id != start_track_id) {
-            continue;
-        }
-        started = 1;
-        s_queue[s_qlen++] = id;
-    }
-    sqlite3_finalize(st);
-    return s_qlen > 0 ? 0 : -1;
+    return play_from_sql(
+        "SELECT id FROM tracks WHERE album_id=?1 "
+        "ORDER BY CASE WHEN IFNULL(track_no,0)=0 THEN 1 ELSE 0 END, "
+        "IFNULL(track_no,0), title COLLATE NOCASE;",
+        album_id, start_track_id);
+}
+
+int library_queue_play_playlist_from(int64_t playlist_id, int64_t start_track_id)
+{
+    return play_from_sql(
+        "SELECT track_id FROM playlist_items WHERE playlist_id=?1 ORDER BY pos;",
+        playlist_id, start_track_id);
 }
 
 int library_queue_play_folder_from(int64_t folder_id, int64_t start_track_id)
 {
-    sqlite3_stmt *st = NULL;
-    int started = 0;
-    s_qlen = 0;
-    s_qidx = 0;
-    if (sqlite3_prepare_v2(s_db,
-                           "SELECT id FROM tracks WHERE folder_id=?1 ORDER BY title COLLATE NOCASE;",
-                           -1, &st, NULL) != SQLITE_OK) {
-        return -1;
-    }
-    sqlite3_bind_int64(st, 1, folder_id);
-    while (sqlite3_step(st) == SQLITE_ROW && s_qlen < VIBE_QUEUE_MAX) {
-        int64_t id = sqlite3_column_int64(st, 0);
-        if (!started && start_track_id != 0 && id != start_track_id) {
-            continue;
-        }
-        started = 1;
-        s_queue[s_qlen++] = id;
-    }
-    sqlite3_finalize(st);
-    return s_qlen > 0 ? 0 : -1;
+    return play_from_sql(
+        "SELECT id FROM tracks WHERE folder_id=?1 ORDER BY path COLLATE NOCASE;",
+        folder_id, start_track_id);
 }
 
 int library_queue_play_track(int64_t track_id)
 {
-    s_qlen = 0;
+    if (track_id <= 0) {
+        return -1;
+    }
+    s_queue[0] = track_id;
+    s_qlen = 1;
     s_qidx = 0;
-    return library_queue_add(track_id);
+    queue_mutated();
+    return 0;
+}
+
+static int i64_cmp(const void *a, const void *b)
+{
+    int64_t da = *(const int64_t *)a;
+    int64_t db = *(const int64_t *)b;
+    if (da < db) {
+        return -1;
+    }
+    if (da > db) {
+        return 1;
+    }
+    return 0;
+}
+
+static void qhas_rebuild(void)
+{
+    int i, w = 0;
+    memcpy(s_qhas, s_queue, (size_t)s_qlen * sizeof(s_qhas[0]));
+    if (s_qlen > 1) {
+        qsort(s_qhas, (size_t)s_qlen, sizeof(s_qhas[0]), i64_cmp);
+    }
+    for (i = 0; i < s_qlen; i++) {
+        if (s_qhas[i] <= 0) {
+            continue;
+        }
+        if (w == 0 || s_qhas[w - 1] != s_qhas[i]) {
+            s_qhas[w++] = s_qhas[i];
+        }
+    }
+    s_qhas_n = w;
+    s_qhas_ready = 1;
+}
+
+int library_queue_has(int64_t track_id)
+{
+    if (track_id <= 0 || s_qlen <= 0) {
+        return 0;
+    }
+    if (!s_qhas_ready) {
+        qhas_rebuild();
+    }
+    return bsearch(&track_id, s_qhas, (size_t)s_qhas_n, sizeof(s_qhas[0]), i64_cmp) != NULL;
+}
+
+static int cover_id_cmp(const void *a, const void *b)
+{
+    int64_t da = ((const QueueCover *)a)->id;
+    int64_t db = ((const QueueCover *)b)->id;
+    if (da < db) {
+        return -1;
+    }
+    if (da > db) {
+        return 1;
+    }
+    return 0;
+}
+
+static int cover_lookup(const QueueCover *arr, int n, int64_t id)
+{
+    QueueCover key;
+    const QueueCover *hit;
+    if (id <= 0 || n <= 0) {
+        return 0;
+    }
+    memset(&key, 0, sizeof(key));
+    key.id = id;
+    hit = bsearch(&key, arr, (size_t)n, sizeof(*arr), cover_id_cmp);
+    if (!hit || hit->total <= 0 || hit->queued <= 0) {
+        return 0;
+    }
+    return hit->queued >= hit->total ? 2 : 1;
+}
+
+static int qset_fill(void)
+{
+    sqlite3_stmt *st = NULL;
+    int i;
+    sqlite3_exec(s_db, "CREATE TEMP TABLE IF NOT EXISTS qset (id INTEGER PRIMARY KEY);",
+                 NULL, NULL, NULL);
+    sqlite3_exec(s_db, "DELETE FROM qset;", NULL, NULL, NULL);
+    if (sqlite3_prepare_v2(s_db, "INSERT OR IGNORE INTO qset(id) VALUES(?1);", -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    for (i = 0; i < s_qlen; i++) {
+        if (s_queue[i] <= 0) {
+            continue;
+        }
+        sqlite3_reset(st);
+        sqlite3_bind_int64(st, 1, s_queue[i]);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    return 0;
+}
+
+static int cover_load_group(const char *sql, QueueCover *out, int cap)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    while (n < cap && sqlite3_step(st) == SQLITE_ROW) {
+        out[n].id = sqlite3_column_int64(st, 0);
+        out[n].queued = sqlite3_column_int(st, 1);
+        out[n].total = sqlite3_column_int(st, 2);
+        n++;
+    }
+    sqlite3_finalize(st);
+    if (n > 1) {
+        qsort(out, (size_t)n, sizeof(out[0]), cover_id_cmp);
+    }
+    return n;
+}
+
+void library_queue_cover_refresh(void)
+{
+    sqlite3_stmt *st = NULL;
+    if (s_cover_ready) {
+        return;
+    }
+    s_cover_nalb = 0;
+    s_cover_nart = 0;
+    s_cover_npl = 0;
+    s_cover_npath = 0;
+    s_cover_nfold = 0;
+    if (!s_db || s_qlen <= 0) {
+        s_cover_ready = 1;
+        return;
+    }
+    if (qset_fill() != 0) {
+        return;
+    }
+    s_cover_nalb = cover_load_group(
+        "SELECT t.album_id, "
+        "SUM(CASE WHEN q.id IS NOT NULL THEN 1 ELSE 0 END), "
+        "COUNT(*) "
+        "FROM tracks t LEFT JOIN qset q ON q.id=t.id "
+        "WHERE t.album_id IN (SELECT DISTINCT album_id FROM tracks WHERE id IN (SELECT id FROM qset)) "
+        "GROUP BY t.album_id;",
+        s_cover_alb, VIBE_QUEUE_MAX);
+    s_cover_nart = cover_load_group(
+        "SELECT t.artist_id, "
+        "SUM(CASE WHEN q.id IS NOT NULL THEN 1 ELSE 0 END), "
+        "COUNT(*) "
+        "FROM tracks t LEFT JOIN qset q ON q.id=t.id "
+        "WHERE t.artist_id IN (SELECT DISTINCT artist_id FROM tracks WHERE id IN (SELECT id FROM qset)) "
+        "GROUP BY t.artist_id;",
+        s_cover_art, VIBE_QUEUE_MAX);
+    s_cover_npl = cover_load_group(
+        "SELECT i.playlist_id, "
+        "SUM(CASE WHEN q.id IS NOT NULL THEN 1 ELSE 0 END), "
+        "COUNT(*) "
+        "FROM playlist_items i LEFT JOIN qset q ON q.id=i.track_id "
+        "WHERE i.playlist_id IN (SELECT DISTINCT playlist_id FROM playlist_items WHERE track_id IN (SELECT id FROM qset)) "
+        "GROUP BY i.playlist_id;",
+        s_cover_pl, VIBE_QUEUE_MAX);
+    if (sqlite3_prepare_v2(s_db,
+                           "SELECT t.path FROM tracks t JOIN qset q ON q.id=t.id;",
+                           -1, &st, NULL) == SQLITE_OK) {
+        while (s_cover_npath < VIBE_QUEUE_MAX && sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char *s = sqlite3_column_text(st, 0);
+            if (s && s[0]) {
+                snprintf(s_cover_path[s_cover_npath], sizeof(s_cover_path[0]), "%s", (const char *)s);
+                s_cover_npath++;
+            }
+        }
+        sqlite3_finalize(st);
+    }
+    s_cover_ready = 1;
+}
+
+int library_queue_cover_album(int64_t album_id)
+{
+    if (!s_cover_ready) {
+        library_queue_cover_refresh();
+    }
+    return cover_lookup(s_cover_alb, s_cover_nalb, album_id);
+}
+
+int library_queue_cover_artist(int64_t artist_id)
+{
+    if (!s_cover_ready) {
+        library_queue_cover_refresh();
+    }
+    return cover_lookup(s_cover_art, s_cover_nart, artist_id);
+}
+
+int library_queue_cover_playlist(int64_t playlist_id)
+{
+    if (!s_cover_ready) {
+        library_queue_cover_refresh();
+    }
+    return cover_lookup(s_cover_pl, s_cover_npl, playlist_id);
+}
+
+static int path_under(const char *root, const char *path)
+{
+    size_t n;
+    if (!root || !root[0] || !path || !path[0]) {
+        return 0;
+    }
+    n = strlen(root);
+    if (strncmp(path, root, n) != 0) {
+        return 0;
+    }
+    return path[n] == '\0' || path[n] == '/';
+}
+
+int library_queue_cover_folder(int64_t folder_id)
+{
+    sqlite3_stmt *st = NULL;
+    char root[VIBE_PATH_MAX];
+    int total = 0, queued = 0, i;
+    if (!s_cover_ready) {
+        library_queue_cover_refresh();
+    }
+    if (!s_db || folder_id <= 0) {
+        return 0;
+    }
+    for (i = 0; i < s_cover_nfold; i++) {
+        if (s_cover_fold[i].id == folder_id) {
+            queued = s_cover_fold[i].queued;
+            total = s_cover_fold[i].total;
+            if (total <= 0 || queued <= 0) {
+                return 0;
+            }
+            return queued >= total ? 2 : 1;
+        }
+    }
+    root[0] = '\0';
+    if (sqlite3_prepare_v2(s_db, "SELECT path FROM folders WHERE id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_int64(st, 1, folder_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *s = sqlite3_column_text(st, 0);
+        if (s) {
+            snprintf(root, sizeof(root), "%s", (const char *)s);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!root[0]) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db,
+                           "SELECT COUNT(*) FROM tracks t JOIN folders f ON f.id=?1 "
+                           "WHERE t.path = f.path OR substr(t.path, 1, length(f.path)+1) = f.path || '/';",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_int64(st, 1, folder_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        total = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    if (total > 0) {
+        for (i = 0; i < s_cover_npath; i++) {
+            if (path_under(root, s_cover_path[i])) {
+                queued++;
+            }
+        }
+    }
+    if (s_cover_nfold < VIBE_QUEUE_MAX) {
+        s_cover_fold[s_cover_nfold].id = folder_id;
+        s_cover_fold[s_cover_nfold].queued = queued;
+        s_cover_fold[s_cover_nfold].total = total > 0 ? total : 1;
+        s_cover_nfold++;
+    }
+    if (total <= 0 || queued <= 0) {
+        return 0;
+    }
+    return queued >= total ? 2 : 1;
 }
 
 int library_queue_remove(int idx)
@@ -1334,6 +2360,56 @@ int library_queue_remove(int idx)
     } else if (idx < s_qidx) {
         s_qidx--;
     }
+    queue_mutated();
+    return 0;
+}
+
+int library_queue_remove_track(int64_t track_id)
+{
+    int n = 0;
+    int i;
+    if (track_id <= 0) {
+        return 0;
+    }
+    for (i = s_qlen - 1; i >= 0; i--) {
+        if (s_queue[i] == track_id) {
+            library_queue_remove(i);
+            n++;
+        }
+    }
+    return n;
+}
+
+int library_queue_export_m3u(const char *path, const char *title)
+{
+    FILE *f;
+    int i;
+    LibTrack t;
+    if (!path || !path[0] || s_qlen <= 0) {
+        return -1;
+    }
+    f = fopen(path, "w");
+    if (!f) {
+        return -1;
+    }
+    fputs("#EXTM3U\n", f);
+    if (title && title[0]) {
+        fprintf(f, "#PLAYLIST:%s\n", title);
+    }
+    for (i = 0; i < s_qlen; i++) {
+        int sec;
+        if (library_queue_get(i, &t) != 0 || !t.path[0]) {
+            continue;
+        }
+        sec = t.duration_ms > 0 ? t.duration_ms / 1000 : -1;
+        fprintf(f, "#EXTINF:%d,%s - %s\n", sec, t.artist[0] ? t.artist : "Unknown",
+                t.title[0] ? t.title : t.path);
+        fprintf(f, "%s\n", t.path);
+    }
+    if (fclose(f) != 0) {
+        return -1;
+    }
+    import_playlist_file(path);
     return 0;
 }
 
@@ -1359,31 +2435,43 @@ void library_queue_clear(void)
 {
     s_qlen = 0;
     s_qidx = 0;
+    queue_mutated();
 }
 
 int library_queue_save(void)
 {
     sqlite3_stmt *st = NULL;
+    int i;
     if (!s_db) {
         return -1;
     }
+    sqlite3_exec(s_db, "BEGIN;", NULL, NULL, NULL);
     sqlite3_exec(s_db, "DELETE FROM last_queue;", NULL, NULL, NULL);
     if (sqlite3_prepare_v2(s_db, "INSERT INTO last_queue(pos, track_id) VALUES(?1,?2);", -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
         return -1;
     }
-    for (int i = 0; i < s_qlen; i++) {
+    for (i = 0; i < s_qlen; i++) {
         sqlite3_reset(st);
         sqlite3_bind_int(st, 1, i);
         sqlite3_bind_int64(st, 2, s_queue[i]);
-        sqlite3_step(st);
+        if (sqlite3_step(st) != SQLITE_DONE) {
+            sqlite3_finalize(st);
+            sqlite3_exec(s_db, "ROLLBACK;", NULL, NULL, NULL);
+            return -1;
+        }
     }
     sqlite3_finalize(st);
+    sqlite3_exec(s_db, "COMMIT;", NULL, NULL, NULL);
     return 0;
 }
 
 int library_queue_load(void)
 {
     sqlite3_stmt *st = NULL;
+    char buf[32];
+    int64_t id = 0;
+    int i, qi;
     s_qlen = 0;
     s_qidx = 0;
     if (!s_db) {
@@ -1396,6 +2484,20 @@ int library_queue_load(void)
         s_queue[s_qlen++] = sqlite3_column_int64(st, 0);
     }
     sqlite3_finalize(st);
+    queue_mutated();
+    if (library_session_get("track_id", buf, (int)sizeof(buf)) == 0) {
+        id = (int64_t)atoll(buf);
+    }
+    if (id > 0) {
+        for (i = 0; i < s_qlen; i++) {
+            if (s_queue[i] == id) {
+                s_qidx = i;
+                return 0;
+            }
+        }
+    }
+    qi = library_session_get_int("queue_index", 0);
+    library_queue_set_index(qi);
     return 0;
 }
 
@@ -1459,10 +2561,10 @@ int library_session_get_int(const char *key, int fallback)
 void library_viz_set_rating(const char *key, int rating)
 {
     sqlite3_stmt *st = NULL;
-    if (!s_db || !key || !key[0]) {
+    if (!s_viz || !key || !key[0]) {
         return;
     }
-    if (sqlite3_prepare_v2(s_db,
+    if (sqlite3_prepare_v2(s_viz,
                            "INSERT INTO viz_ratings(key,rating) VALUES(?1,?2) "
                            "ON CONFLICT(key) DO UPDATE SET rating=excluded.rating;",
                            -1, &st, NULL) != SQLITE_OK) {
@@ -1478,10 +2580,10 @@ int library_viz_get_rating(const char *key)
 {
     sqlite3_stmt *st = NULL;
     int r = 0;
-    if (!s_db || !key || !key[0]) {
+    if (!s_viz || !key || !key[0]) {
         return 0;
     }
-    if (sqlite3_prepare_v2(s_db, "SELECT rating FROM viz_ratings WHERE key=?1;", -1, &st, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(s_viz, "SELECT rating FROM viz_ratings WHERE key=?1;", -1, &st, NULL) != SQLITE_OK) {
         return 0;
     }
     sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT);
@@ -1490,6 +2592,30 @@ int library_viz_get_rating(const char *key)
     }
     sqlite3_finalize(st);
     return r;
+}
+
+int library_viz_each_rating(int (*fn)(const char *key, int rating, void *ud), void *ud)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!s_viz || !fn) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_viz, "SELECT key, rating FROM viz_ratings;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *k = sqlite3_column_text(st, 0);
+        int r = sqlite3_column_int(st, 1);
+        if (k && k[0]) {
+            if (fn((const char *)k, r, ud) != 0) {
+                break;
+            }
+            n++;
+        }
+    }
+    sqlite3_finalize(st);
+    return n;
 }
 
 int library_radio_custom_add(const char *name, const char *url)
@@ -1698,6 +2824,357 @@ int library_radio_fav_remove(int64_t id)
         return -1;
     }
     sqlite3_bind_int64(st, 1, id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return 0;
+}
+
+int library_artist_fav_has(int64_t artist_id)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!s_db || artist_id <= 0) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "SELECT 1 FROM artist_fav WHERE artist_id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_int64(st, 1, artist_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        n = 1;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int library_artist_fav_toggle(int64_t artist_id)
+{
+    sqlite3_stmt *st = NULL;
+    if (!s_db || artist_id <= 0) {
+        return -1;
+    }
+    if (library_artist_fav_has(artist_id)) {
+        if (sqlite3_prepare_v2(s_db, "DELETE FROM artist_fav WHERE artist_id=?1;", -1, &st, NULL) != SQLITE_OK) {
+            return -1;
+        }
+        sqlite3_bind_int64(st, 1, artist_id);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "INSERT INTO artist_fav(artist_id) VALUES(?1);", -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, artist_id);
+    if (sqlite3_step(st) != SQLITE_DONE) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    sqlite3_finalize(st);
+    return 1;
+}
+
+int library_artist_fav_count(void)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!s_db) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "SELECT COUNT(*) FROM artist_fav;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int library_artist_fav_list(LibArtist *out, int cap)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!s_db || !out || cap <= 0) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db,
+                           "SELECT a.id, a.name, "
+                           "(SELECT COUNT(DISTINCT t.album_id) FROM tracks t WHERE t.artist_id=a.id) "
+                           "FROM artist_fav f JOIN artists a ON a.id=f.artist_id "
+                           "ORDER BY a.name COLLATE NOCASE;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    while (n < cap && sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *s;
+        memset(&out[n], 0, sizeof(out[n]));
+        out[n].id = sqlite3_column_int64(st, 0);
+        s = sqlite3_column_text(st, 1);
+        if (s) {
+            snprintf(out[n].name, sizeof(out[n].name), "%s", (const char *)s);
+        }
+        out[n].album_count = sqlite3_column_int(st, 2);
+        n++;
+    }
+    sqlite3_finalize(st);
+    if (n > 1) {
+        qsort(out, (size_t)n, sizeof(out[0]), artist_name_cmp);
+    }
+    return n;
+}
+
+int library_artist_fav_remove(int64_t artist_id)
+{
+    sqlite3_stmt *st = NULL;
+    if (!s_db || artist_id <= 0) {
+        return -1;
+    }
+    if (sqlite3_prepare_v2(s_db, "DELETE FROM artist_fav WHERE artist_id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, artist_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return 0;
+}
+
+int library_album_fav_has(int64_t album_id)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!s_db || album_id <= 0) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "SELECT 1 FROM album_fav WHERE album_id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_int64(st, 1, album_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        n = 1;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int library_album_fav_toggle(int64_t album_id)
+{
+    sqlite3_stmt *st = NULL;
+    if (!s_db || album_id <= 0) {
+        return -1;
+    }
+    if (library_album_fav_has(album_id)) {
+        if (sqlite3_prepare_v2(s_db, "DELETE FROM album_fav WHERE album_id=?1;", -1, &st, NULL) != SQLITE_OK) {
+            return -1;
+        }
+        sqlite3_bind_int64(st, 1, album_id);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "INSERT INTO album_fav(album_id) VALUES(?1);", -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, album_id);
+    if (sqlite3_step(st) != SQLITE_DONE) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    sqlite3_finalize(st);
+    return 1;
+}
+
+int library_album_fav_count(void)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!s_db) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "SELECT COUNT(*) FROM album_fav;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int library_album_fav_list(LibAlbum *out, int cap)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    char sql[1200];
+    if (!s_db || !out || cap <= 0) {
+        return 0;
+    }
+    snprintf(sql, sizeof(sql),
+             "%s JOIN album_fav f ON f.album_id=b.id GROUP BY b.id;",
+             k_album_from);
+    if (sqlite3_prepare_v2(s_db, sql, -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    while (n < cap && sqlite3_step(st) == SQLITE_ROW) {
+        fill_album_from_row(st, &out[n]);
+        n++;
+    }
+    sqlite3_finalize(st);
+    if (n > 1) {
+        qsort(out, (size_t)n, sizeof(out[0]), album_name_cmp);
+    }
+    return n;
+}
+
+int library_album_fav_remove(int64_t album_id)
+{
+    sqlite3_stmt *st = NULL;
+    if (!s_db || album_id <= 0) {
+        return -1;
+    }
+    if (sqlite3_prepare_v2(s_db, "DELETE FROM album_fav WHERE album_id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, album_id);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+    return 0;
+}
+
+static int playlist_path_by_id(int64_t playlist_id, char *out, int n)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+    if (!s_db || playlist_id <= 0 || !out || n <= 0) {
+        return -1;
+    }
+    out[0] = '\0';
+    if (sqlite3_prepare_v2(s_db, "SELECT path FROM playlists WHERE id=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, playlist_id);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *s = sqlite3_column_text(st, 0);
+        if (s && s[0]) {
+            snprintf(out, (size_t)n, "%s", (const char *)s);
+            rc = 0;
+        }
+    }
+    sqlite3_finalize(st);
+    return rc;
+}
+
+int library_playlist_fav_has(int64_t playlist_id)
+{
+    sqlite3_stmt *st = NULL;
+    char path[VIBE_PATH_MAX];
+    int n = 0;
+    if (playlist_path_by_id(playlist_id, path, (int)sizeof(path)) != 0) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "SELECT 1 FROM playlist_fav WHERE path=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        n = 1;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int library_playlist_fav_toggle(int64_t playlist_id)
+{
+    sqlite3_stmt *st = NULL;
+    char path[VIBE_PATH_MAX];
+    if (playlist_path_by_id(playlist_id, path, (int)sizeof(path)) != 0) {
+        return -1;
+    }
+    if (library_playlist_fav_has(playlist_id)) {
+        if (sqlite3_prepare_v2(s_db, "DELETE FROM playlist_fav WHERE path=?1;", -1, &st, NULL) != SQLITE_OK) {
+            return -1;
+        }
+        sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db, "INSERT INTO playlist_fav(path) VALUES(?1);", -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_DONE) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    sqlite3_finalize(st);
+    return 1;
+}
+
+int library_playlist_fav_count(void)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!s_db) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db,
+                           "SELECT COUNT(*) FROM playlist_fav f "
+                           "JOIN playlists p ON p.path=f.path;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        n = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+int library_playlist_fav_list(LibPlaylist *out, int cap)
+{
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (!s_db || !out || cap <= 0) {
+        return 0;
+    }
+    if (sqlite3_prepare_v2(s_db,
+                           "SELECT p.id, p.name, "
+                           "(SELECT COUNT(*) FROM playlist_items i WHERE i.playlist_id=p.id) "
+                           "FROM playlist_fav f JOIN playlists p ON p.path=f.path "
+                           "ORDER BY p.name COLLATE NOCASE;",
+                           -1, &st, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    while (n < cap && sqlite3_step(st) == SQLITE_ROW) {
+        const unsigned char *s;
+        memset(&out[n], 0, sizeof(out[n]));
+        out[n].id = sqlite3_column_int64(st, 0);
+        s = sqlite3_column_text(st, 1);
+        if (s) {
+            snprintf(out[n].name, sizeof(out[n].name), "%s", (const char *)s);
+        }
+        out[n].item_count = sqlite3_column_int(st, 2);
+        n++;
+    }
+    sqlite3_finalize(st);
+    if (n > 1) {
+        qsort(out, (size_t)n, sizeof(out[0]), playlist_name_cmp);
+    }
+    return n;
+}
+
+int library_playlist_fav_remove(int64_t playlist_id)
+{
+    sqlite3_stmt *st = NULL;
+    char path[VIBE_PATH_MAX];
+    if (playlist_path_by_id(playlist_id, path, (int)sizeof(path)) != 0) {
+        return -1;
+    }
+    if (sqlite3_prepare_v2(s_db, "DELETE FROM playlist_fav WHERE path=?1;", -1, &st, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    sqlite3_bind_text(st, 1, path, -1, SQLITE_TRANSIENT);
     sqlite3_step(st);
     sqlite3_finalize(st);
     return 0;

@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #include "viz.h"
 
 #include "config.h"
@@ -144,6 +148,22 @@ static int viz_cmp(const void *a, const void *b)
     return strcasecmp(s_pname[ia], s_pname[ib]);
 }
 
+static int viz_apply_rating(const char *key, int rating, void *ud)
+{
+    int i;
+    (void)ud;
+    if (!key || !key[0] || !s_pname || !s_rate) {
+        return 0;
+    }
+    for (i = 0; i < s_ncache; i++) {
+        if (s_pname[i][0] && strcmp(s_pname[i], key) == 0) {
+            s_rate[i] = rating;
+            break;
+        }
+    }
+    return 0;
+}
+
 static void viz_build_index(void)
 {
     uint32_t n, i;
@@ -174,10 +194,11 @@ static void viz_build_index(void)
         split_preset_path(items[i], s_pname[i], sizeof(s_pname[i]),
                           s_pcat[i], sizeof(s_pcat[i]));
         s_order[i] = (int)i;
-        s_rate[i] = library_viz_get_rating(s_pname[i]);
+        s_rate[i] = 0;
     }
     projectm_playlist_free_string_array(items);
     s_ncache = (int)n;
+    library_viz_each_rating(viz_apply_rating, NULL);
     qsort(s_order, (size_t)n, sizeof(int), viz_cmp);
 }
 
@@ -397,9 +418,7 @@ void viz_next_preset(int hard)
     if (!s_pl) {
         return;
     }
-    if (!viz_skip_to_allowed(1, hard)) {
-        projectm_playlist_play_next(s_pl, hard ? true : false);
-    }
+    viz_skip_to_allowed(1, hard);
 }
 
 void viz_prev_preset(int hard)
@@ -407,9 +426,7 @@ void viz_prev_preset(int hard)
     if (!s_pl) {
         return;
     }
-    if (!viz_skip_to_allowed(-1, hard)) {
-        projectm_playlist_play_previous(s_pl, hard ? true : false);
-    }
+    viz_skip_to_allowed(-1, hard);
 }
 
 void viz_set_lock(int lock)

@@ -1,3 +1,19 @@
+StOMP — Steam OS Music Player
+Copyright (C) 2026 JobDestroyer
+
+StOMP is free software; you can redistribute it and/or modify it under
+the terms of the GNU Lesser General Public License, version 2.1, as
+published by the Free Software Foundation. The full license text follows.
+
+Third-party notices shipped with this tree:
+  libprojectM 4.1.2 — LGPL-2.1 (third_party/projectm/LICENSE.txt)
+  SQLite 3.46.1 amalgamation — public domain (third_party/sqlite3.c)
+  DejaVu Sans — fonts/LICENSE-DejaVu.txt
+  Droid Sans Fallback — Apache 2.0 (fonts/LICENSE-Apache-2.0.txt)
+  Cream of the Crop presets — presets/cream-of-the-crop/LICENSE.md
+
+================================================================
+
 		  GNU LESSER GENERAL PUBLIC LICENSE
 		       Version 2.1, February 1999
 

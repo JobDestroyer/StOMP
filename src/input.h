@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #ifndef VIBE_INPUT_H
 #define VIBE_INPUT_H
 
@@ -12,6 +16,8 @@ typedef enum {
     VIBE_CMD_CONFIRM_HOLD,
     VIBE_CMD_BACK,
     VIBE_CMD_QUEUE_ADD,
+    VIBE_CMD_QUEUE_ADD_HOLD,
+    VIBE_CMD_QUEUE_APPEND,
     VIBE_CMD_SEARCH_OR_REMOVE,
     VIBE_CMD_SEARCH_BACKSPACE,
     VIBE_CMD_SEARCH_CLEAR,

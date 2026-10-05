@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #include "ui.h"
 
 #include "app.h"
@@ -33,7 +37,7 @@ typedef struct {
 
 typedef struct {
     char line[128];
-    char sub[128];
+    char sub[192];
     int64_t id;
     int kind;
 } Row;
@@ -69,17 +73,22 @@ static int s_scroll;
 static char s_search[64];
 static int s_kb_i;
 static int s_show_kb;
+static int s_kb_shift;
+static int s_kb_sym;
+static int s_kb_zone;
+static size_t s_kb_caret;
 static int s_np_opt; /* 0 = seek strip (A play/pause); 1+ = extras row */
 #define NP_OPT_PREV 1
 #define NP_OPT_PLAY 2
 #define NP_OPT_STOP 3
 #define NP_OPT_NEXT 4
 #define NP_OPT_SHUFFLE 5
-#define NP_OPT_VOLUME 6
-#define NP_OPT_PRESET 7
-#define NP_OPT_EYE 8
-#define NP_OPT_LOCK 9
-#define NP_OPT_MAX 9
+#define NP_OPT_REPEAT 6
+#define NP_OPT_VOLUME 7
+#define NP_OPT_PRESET 8
+#define NP_OPT_EYE 9
+#define NP_OPT_LOCK 10
+#define NP_OPT_MAX 10
 static int s_kb_active = 1;
 static int64_t s_ctx_album, s_ctx_artist, s_ctx_folder, s_ctx_playlist;
 static int64_t s_folder_stack[FOLDER_STACK];
@@ -94,13 +103,17 @@ static int s_rate_flash_good;
 static char s_radio_cc[8];
 static char s_radio_url[VIBE_PATH_MAX];
 static char s_radio_err[160];
-static char s_radio_play_url[512][VIBE_PATH_MAX];
-static int s_radio_pending;
-static int s_radio_hold_did;
+#define RADIO_URL_SLOTS 1024
+static char s_radio_play_url[RADIO_URL_SLOTS][VIBE_PATH_MAX];
+static int s_hold_kind;
+static int s_hold_did;
+static int s_quit_prompt;
+static int s_quit_choice;
 static int s_bind_capture;
 static int s_bind_target;
 static char s_folder_title[VIBE_NAME_MAX];
 static int s_settings_audio_i;
+static char s_pl_name[VIBE_NAME_MAX];
 static char s_browse[VIBE_PATH_MAX];
 static char s_dirents[VIBE_LIST_MAX][VIBE_NAME_MAX];
 /* Query scratch lives in BSS: LibTrack[VIBE_LIST_MAX] is ~7MB and must not sit on the stack. */
@@ -115,45 +128,93 @@ static int s_ndirents;
 static uint32_t s_jump_cp;
 static uint32_t s_jump_ms;
 
+#define KB_SPEC_BKSP  1
+#define KB_SPEC_CLEAR 2
+#define KB_SPEC_DONE  3
+#define KB_SPEC_SHIFT 4
+#define KB_SPEC_SYMS  5
+#define KB_SPEC_STEAM 6
+#define KB_ZONE_FIELD 0
+#define KB_ZONE_KEYS  1
+#define KB_COLS 10
+#define KB_ROWS 6
+
 typedef struct {
     int row;
     int col;
     int span;
     char ch;  /* 0 = special */
-    unsigned special; /* 1 backspace, 2 clear */
-    const char *label;
+    unsigned special;
 } KbKey;
 
-static const KbKey k_keys[] = {
-    {0, 0, 1, '1', 0, "1"}, {0, 1, 1, '2', 0, "2"}, {0, 2, 1, '3', 0, "3"},
-    {0, 3, 1, '4', 0, "4"}, {0, 4, 1, '5', 0, "5"}, {0, 5, 1, '6', 0, "6"},
-    {0, 6, 1, '7', 0, "7"}, {0, 7, 1, '8', 0, "8"}, {0, 8, 1, '9', 0, "9"},
-    {0, 9, 1, '0', 0, "0"},
-    {1, 0, 1, 'Q', 0, "Q"}, {1, 1, 1, 'W', 0, "W"}, {1, 2, 1, 'E', 0, "E"},
-    {1, 3, 1, 'R', 0, "R"}, {1, 4, 1, 'T', 0, "T"}, {1, 5, 1, 'Y', 0, "Y"},
-    {1, 6, 1, 'U', 0, "U"}, {1, 7, 1, 'I', 0, "I"}, {1, 8, 1, 'O', 0, "O"},
-    {1, 9, 1, 'P', 0, "P"},
-    {2, 0, 1, 'A', 0, "A"}, {2, 1, 1, 'S', 0, "S"}, {2, 2, 1, 'D', 0, "D"},
-    {2, 3, 1, 'F', 0, "F"}, {2, 4, 1, 'G', 0, "G"}, {2, 5, 1, 'H', 0, "H"},
-    {2, 6, 1, 'J', 0, "J"}, {2, 7, 1, 'K', 0, "K"}, {2, 8, 1, 'L', 0, "L"},
-    {3, 0, 1, 'Z', 0, "Z"}, {3, 1, 1, 'X', 0, "X"}, {3, 2, 1, 'C', 0, "C"},
-    {3, 3, 1, 'V', 0, "V"}, {3, 4, 1, 'B', 0, "B"}, {3, 5, 1, 'N', 0, "N"},
-    {3, 6, 1, 'M', 0, "M"},
-    {4, 0, 1, '-', 0, "-"}, {4, 1, 1, '_', 0, "_"}, {4, 2, 3, ' ', 0, "Space"},
-    {5, 0, 2, 0, 2, "Clear"}, {5, 2, 3, 0, 1, "Bksp"}, {5, 5, 4, 0, 3, "Enter"}
+static const KbKey k_letter_keys[] = {
+    {0, 0, 1, '1', 0}, {0, 1, 1, '2', 0}, {0, 2, 1, '3', 0},
+    {0, 3, 1, '4', 0}, {0, 4, 1, '5', 0}, {0, 5, 1, '6', 0},
+    {0, 6, 1, '7', 0}, {0, 7, 1, '8', 0}, {0, 8, 1, '9', 0},
+    {0, 9, 1, '0', 0},
+    {1, 0, 1, 'q', 0}, {1, 1, 1, 'w', 0}, {1, 2, 1, 'e', 0},
+    {1, 3, 1, 'r', 0}, {1, 4, 1, 't', 0}, {1, 5, 1, 'y', 0},
+    {1, 6, 1, 'u', 0}, {1, 7, 1, 'i', 0}, {1, 8, 1, 'o', 0},
+    {1, 9, 1, 'p', 0},
+    {2, 0, 1, 'a', 0}, {2, 1, 1, 's', 0}, {2, 2, 1, 'd', 0},
+    {2, 3, 1, 'f', 0}, {2, 4, 1, 'g', 0}, {2, 5, 1, 'h', 0},
+    {2, 6, 1, 'j', 0}, {2, 7, 1, 'k', 0}, {2, 8, 1, 'l', 0},
+    {2, 9, 1, '\'', 0},
+    {3, 0, 1, 'z', 0}, {3, 1, 1, 'x', 0}, {3, 2, 1, 'c', 0},
+    {3, 3, 1, 'v', 0}, {3, 4, 1, 'b', 0}, {3, 5, 1, 'n', 0},
+    {3, 6, 1, 'm', 0}, {3, 7, 1, '-', 0}, {3, 8, 1, '_', 0},
+    {3, 9, 1, '.', 0},
+    {4, 0, 2, 0, KB_SPEC_SHIFT}, {4, 2, 2, 0, KB_SPEC_SYMS},
+    {4, 4, 4, ' ', 0}, {4, 8, 2, 0, KB_SPEC_BKSP},
+    {5, 0, 4, 0, KB_SPEC_STEAM}, {5, 4, 3, 0, KB_SPEC_CLEAR},
+    {5, 7, 3, 0, KB_SPEC_DONE}
 };
 
-#define KB_N ((int)(sizeof(k_keys) / sizeof(k_keys[0])))
+static const KbKey k_symbol_keys[] = {
+    {0, 0, 1, '1', 0}, {0, 1, 1, '2', 0}, {0, 2, 1, '3', 0},
+    {0, 3, 1, '4', 0}, {0, 4, 1, '5', 0}, {0, 5, 1, '6', 0},
+    {0, 6, 1, '7', 0}, {0, 7, 1, '8', 0}, {0, 8, 1, '9', 0},
+    {0, 9, 1, '0', 0},
+    {1, 0, 1, '-', 0}, {1, 1, 1, '_', 0}, {1, 2, 1, '=', 0},
+    {1, 3, 1, '+', 0}, {1, 4, 1, '/', 0}, {1, 5, 1, '\\', 0},
+    {1, 6, 1, ':', 0}, {1, 7, 1, ';', 0}, {1, 8, 1, '@', 0},
+    {1, 9, 1, '#', 0},
+    {2, 0, 1, '.', 0}, {2, 1, 1, ',', 0}, {2, 2, 1, '?', 0},
+    {2, 3, 1, '!', 0}, {2, 4, 1, '&', 0}, {2, 5, 1, '%', 0},
+    {2, 6, 1, '~', 0}, {2, 7, 1, '*', 0}, {2, 8, 1, '"', 0},
+    {2, 9, 1, '\'', 0},
+    {3, 0, 1, '(', 0}, {3, 1, 1, ')', 0}, {3, 2, 1, '[', 0},
+    {3, 3, 1, ']', 0}, {3, 4, 1, '{', 0}, {3, 5, 1, '}', 0},
+    {3, 6, 1, '<', 0}, {3, 7, 1, '>', 0}, {3, 8, 1, '|', 0},
+    {3, 9, 1, '$', 0},
+    {4, 0, 2, 0, KB_SPEC_SHIFT}, {4, 2, 2, 0, KB_SPEC_SYMS},
+    {4, 4, 4, ' ', 0}, {4, 8, 2, 0, KB_SPEC_BKSP},
+    {5, 0, 4, 0, KB_SPEC_STEAM}, {5, 4, 3, 0, KB_SPEC_CLEAR},
+    {5, 7, 3, 0, KB_SPEC_DONE}
+};
+
+static const KbKey *kb_cur(void)
+{
+    return s_kb_sym ? k_symbol_keys : k_letter_keys;
+}
+
+static int kb_count(void)
+{
+    return s_kb_sym ? (int)(sizeof(k_symbol_keys) / sizeof(k_symbol_keys[0]))
+                    : (int)(sizeof(k_letter_keys) / sizeof(k_letter_keys[0]));
+}
 
 static int kb_find(int row, int col)
 {
+    const KbKey *keys = kb_cur();
+    int n = kb_count();
     int best = -1, bestd = 99, i;
-    for (i = 0; i < KB_N; i++) {
+    for (i = 0; i < n; i++) {
         int d;
-        if (k_keys[i].row != row) {
+        if (keys[i].row != row) {
             continue;
         }
-        d = k_keys[i].col - col;
+        d = keys[i].col - col;
         if (d < 0) {
             d = -d;
         }
@@ -167,19 +228,27 @@ static int kb_find(int row, int col)
 
 static void kb_move(int dr, int dc)
 {
-    int row = k_keys[s_kb_i].row;
-    int col = k_keys[s_kb_i].col;
-    int next;
+    const KbKey *keys = kb_cur();
+    int n = kb_count();
+    int row, col, next;
+    if (s_kb_i < 0 || s_kb_i >= n) {
+        s_kb_i = 0;
+    }
+    row = keys[s_kb_i].row;
+    col = keys[s_kb_i].col;
     if (dc != 0) {
         next = s_kb_i + dc;
-        if (next >= 0 && next < KB_N && k_keys[next].row == row) {
+        if (next >= 0 && next < n && keys[next].row == row) {
             s_kb_i = next;
-            return;
         }
         return;
     }
     row += dr;
-    if (row < 0 || row > 5) {
+    if (row < 0) {
+        s_kb_zone = KB_ZONE_FIELD;
+        return;
+    }
+    if (row >= KB_ROWS) {
         return;
     }
     next = kb_find(row, col);
@@ -410,14 +479,23 @@ static int atlas_pack(int bw, int bh, int *ox, int *oy)
 
 static void atlas_blit(int x, int y, int bw, int bh, const unsigned char *src, int pitch)
 {
+    static unsigned char scratch[96 * 96 * 4];
     unsigned char *rgba;
     int row, col;
+    size_t need;
+    int heap = 0;
     if (bw <= 0 || bh <= 0 || !src) {
         return;
     }
-    rgba = (unsigned char *)malloc((size_t)bw * (size_t)bh * 4u);
-    if (!rgba) {
-        return;
+    need = (size_t)bw * (size_t)bh * 4u;
+    if (need <= sizeof(scratch)) {
+        rgba = scratch;
+    } else {
+        rgba = (unsigned char *)malloc(need);
+        if (!rgba) {
+            return;
+        }
+        heap = 1;
     }
     for (row = 0; row < bh; row++) {
         const unsigned char *srow = src + row * pitch;
@@ -433,7 +511,9 @@ static void atlas_blit(int x, int y, int bw, int bh, const unsigned char *src, i
     glBindTexture(GL_TEXTURE_2D, s_atlas);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, bw, bh, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
-    free(rgba);
+    if (heap) {
+        free(rgba);
+    }
 }
 
 static void font_reset_atlas(void);
@@ -680,6 +760,9 @@ static int build_prog(void)
     return 0;
 }
 
+static int kb_on(void);
+static void sync_text_input(void);
+
 int ui_init(int win_w, int win_h, float veil)
 {
     s_win_w = win_w > 0 ? win_w : 1920;
@@ -697,6 +780,7 @@ int ui_init(int win_w, int win_h, float veil)
     if (load_font() != 0) {
         fprintf(stderr, "StOMP: continuing without a font atlas\n");
     }
+    sync_text_input();
     return 0;
 }
 
@@ -736,9 +820,44 @@ void ui_set_veil(float veil)
     s_veil = veil;
 }
 
+static void kb_field_geom(float *x, float *y, float *w, float *h)
+{
+    *x = 64.f * s_scale;
+    *y = 110.f * s_scale;
+    *w = (float)s_win_w - 128.f * s_scale;
+    *h = 76.f * s_scale;
+    if (*w < 64.f) {
+        *w = 64.f;
+    }
+}
+
+static void kb_set_text_rect(void)
+{
+    SDL_Rect r;
+    float x, y, w, h;
+    kb_field_geom(&x, &y, &w, &h);
+    r.x = (int)x;
+    r.y = (int)y;
+    r.w = (int)w;
+    r.h = (int)h;
+    SDL_SetTextInputRect(&r);
+}
+
+static void open_steam_keyboard(void)
+{
+    kb_set_text_rect();
+    SDL_StartTextInput();
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+    if (SDL_OpenURL("steam://open/keyboard") != 0) {
+        fprintf(stderr, "StOMP: steam keyboard: %s\n", SDL_GetError());
+    }
+#endif
+}
+
 static void sync_text_input(void)
 {
-    if (s_view == UI_VIEW_SEARCH) {
+    if (kb_on()) {
+        kb_set_text_rect();
         SDL_StartTextInput();
     } else {
         SDL_StopTextInput();
@@ -891,26 +1010,289 @@ static void add_row(const char *line, const char *sub, int64_t id, int kind)
     r->kind = kind;
 }
 
+static void add_track_row(const char *title, const char *base, int64_t id)
+{
+    char marked[160];
+    const char *use = base ? base : "";
+    if (library_queue_has(id)) {
+        if (use[0]) {
+            snprintf(marked, sizeof(marked), "%s  ·  On Current Playlist", use);
+        } else {
+            snprintf(marked, sizeof(marked), "On Current Playlist");
+        }
+        use = marked;
+    }
+    add_row(title, use, id, UI_KIND_TRACK);
+}
+
+static void fmt_queue_cover(char *out, size_t n, const char *base, int cover)
+{
+    char tmp[160];
+    const char *tag = NULL;
+    if (!out || n == 0) {
+        return;
+    }
+    if (cover >= 2) {
+        tag = "On Current Playlist";
+    } else if (cover == 1) {
+        tag = "Partially On Playlist";
+    }
+    if (tag && base && base[0]) {
+        snprintf(tmp, sizeof(tmp), "%s  ·  %s", base, tag);
+    } else if (tag) {
+        snprintf(tmp, sizeof(tmp), "%s", tag);
+    } else {
+        snprintf(tmp, sizeof(tmp), "%s", base ? base : "");
+    }
+    snprintf(out, n, "%s", tmp);
+}
+
 static int kb_on(void)
 {
-    return (s_view == UI_VIEW_SEARCH && s_show_kb) || s_view == UI_VIEW_RADIO_ADD;
+    return s_view == UI_VIEW_SEARCH || s_view == UI_VIEW_RADIO_ADD ||
+           s_view == UI_VIEW_QUEUE_SAVE;
 }
 
 static char *kb_buf(void)
 {
-    return s_view == UI_VIEW_RADIO_ADD ? s_radio_url : s_search;
+    if (s_view == UI_VIEW_RADIO_ADD) {
+        return s_radio_url;
+    }
+    if (s_view == UI_VIEW_QUEUE_SAVE) {
+        return s_pl_name;
+    }
+    return s_search;
 }
 
 static size_t kb_cap(void)
 {
-    return s_view == UI_VIEW_RADIO_ADD ? sizeof(s_radio_url) : sizeof(s_search);
+    if (s_view == UI_VIEW_RADIO_ADD) {
+        return sizeof(s_radio_url);
+    }
+    if (s_view == UI_VIEW_QUEUE_SAVE) {
+        return sizeof(s_pl_name);
+    }
+    return sizeof(s_search);
+}
+
+static const char *kb_placeholder(void)
+{
+    if (s_view == UI_VIEW_RADIO_ADD) {
+        return "Stream URL";
+    }
+    if (s_view == UI_VIEW_QUEUE_SAVE) {
+        return "Playlist name";
+    }
+    return "Search library";
+}
+
+static void kb_clamp_caret(void)
+{
+    size_t n = strlen(kb_buf());
+    if (s_kb_caret > n) {
+        s_kb_caret = n;
+    }
+}
+
+static size_t kb_utf8_prev(const char *s, size_t i)
+{
+    if (i == 0) {
+        return 0;
+    }
+    i--;
+    while (i > 0 && ((unsigned char)s[i] & 0xC0) == 0x80) {
+        i--;
+    }
+    return i;
+}
+
+static size_t kb_utf8_nexti(const char *s, size_t i)
+{
+    unsigned char c;
+    size_t n;
+    if (!s[i]) {
+        return i;
+    }
+    c = (unsigned char)s[i];
+    if ((c & 0x80) == 0) {
+        i += 1;
+    } else if ((c & 0xE0) == 0xC0) {
+        i += 2;
+    } else if ((c & 0xF0) == 0xE0) {
+        i += 3;
+    } else if ((c & 0xF8) == 0xF0) {
+        i += 4;
+    } else {
+        i += 1;
+    }
+    n = strlen(s);
+    if (i > n) {
+        i = n;
+    }
+    return i;
+}
+
+static void kb_insert(const char *text)
+{
+    char *buf = kb_buf();
+    size_t cap = kb_cap();
+    size_t n, m, c;
+    if (!text || !text[0]) {
+        return;
+    }
+    n = strlen(buf);
+    m = strlen(text);
+    kb_clamp_caret();
+    c = s_kb_caret;
+    if (n + m >= cap) {
+        size_t room = (cap > n + 1) ? cap - 1 - n : 0;
+        if (room == 0) {
+            return;
+        }
+        while (room > 0 && ((unsigned char)text[room] & 0xC0) == 0x80) {
+            room--;
+        }
+        if (room == 0 || ((unsigned char)text[room] & 0xC0) == 0x80) {
+            return;
+        }
+        m = room;
+    }
+    memmove(buf + c + m, buf + c, n - c + 1);
+    memcpy(buf + c, text, m);
+    s_kb_caret = c + m;
+}
+
+static void kb_backspace(void)
+{
+    char *buf = kb_buf();
+    size_t n, c, p;
+    kb_clamp_caret();
+    c = s_kb_caret;
+    if (c == 0) {
+        return;
+    }
+    p = kb_utf8_prev(buf, c);
+    n = strlen(buf);
+    memmove(buf + p, buf + c, n - c + 1);
+    s_kb_caret = p;
+}
+
+static void kb_clear(void)
+{
+    kb_buf()[0] = '\0';
+    s_kb_caret = 0;
+}
+
+static void kb_reset(void)
+{
+    s_show_kb = 1;
+    s_kb_active = 1;
+    s_kb_i = 0;
+    s_kb_shift = 0;
+    s_kb_sym = 0;
+    s_kb_zone = KB_ZONE_KEYS;
+    s_kb_caret = strlen(kb_buf());
+}
+
+static int kb_nav(int dr, int dc)
+{
+    const KbKey *keys;
+    int n;
+    if (!kb_on() || !s_kb_active) {
+        return 0;
+    }
+    if (s_kb_zone == KB_ZONE_FIELD) {
+        kb_clamp_caret();
+        if (dc < 0) {
+            s_kb_caret = kb_utf8_prev(kb_buf(), s_kb_caret);
+        } else if (dc > 0) {
+            s_kb_caret = kb_utf8_nexti(kb_buf(), s_kb_caret);
+        } else if (dr > 0) {
+            if (s_nrows > 0) {
+                s_kb_active = 0;
+                s_focus = 0;
+            } else {
+                s_kb_zone = KB_ZONE_KEYS;
+            }
+        }
+        return 1;
+    }
+    n = kb_count();
+    if (s_kb_i < 0 || s_kb_i >= n) {
+        s_kb_i = 0;
+    }
+    keys = kb_cur();
+    if (dr < 0 && keys[s_kb_i].row == 0) {
+        if (s_nrows > 0) {
+            s_kb_active = 0;
+            s_focus = s_nrows - 1;
+        } else {
+            s_kb_zone = KB_ZONE_FIELD;
+        }
+        return 1;
+    }
+    kb_move(dr, dc);
+    return 1;
+}
+
+static void kb_key_label(const KbKey *k, char *out, size_t n)
+{
+    char c;
+    if (!k || !out || n == 0) {
+        return;
+    }
+    if (k->special == KB_SPEC_BKSP) {
+        snprintf(out, n, "Bksp");
+    } else if (k->special == KB_SPEC_CLEAR) {
+        snprintf(out, n, "Clear");
+    } else if (k->special == KB_SPEC_DONE) {
+        snprintf(out, n, s_view == UI_VIEW_SEARCH ? "Done" : "Save");
+    } else if (k->special == KB_SPEC_SHIFT) {
+        snprintf(out, n, s_kb_shift ? "abc" : "ABC");
+    } else if (k->special == KB_SPEC_SYMS) {
+        snprintf(out, n, s_kb_sym ? "abc" : "123");
+    } else if (k->special == KB_SPEC_STEAM) {
+        snprintf(out, n, "Steam Keyboard");
+    } else if (k->ch == ' ') {
+        snprintf(out, n, "Space");
+    } else {
+        c = k->ch;
+        if (!s_kb_sym && c >= 'a' && c <= 'z' && s_kb_shift) {
+            c = (char)(c - 'a' + 'A');
+        }
+        out[0] = c;
+        out[1] = '\0';
+    }
+}
+
+static int list_vis_rows(void)
+{
+    float row_h = 72.f * s_scale;
+    float top = 110.f * s_scale;
+    float kb_reserve = 0.f;
+    int vis;
+    if (kb_on()) {
+        float fx, fy, fw, fh;
+        kb_field_geom(&fx, &fy, &fw, &fh);
+        top = fy + fh + 16.f * s_scale;
+        kb_reserve = 330.f * s_scale;
+    }
+    vis = (int)(((float)s_win_h - top - 24.f * s_scale - kb_reserve) / row_h);
+    if (kb_on()) {
+        if (vis < 2) {
+            vis = 2;
+        }
+    } else if (vis < 3) {
+        vis = 3;
+    }
+    return vis;
 }
 
 static void add_radio_row(const char *line, const char *sub, const char *url, int64_t id)
 {
     char marked[VIBE_NAME_MAX];
     const char *use = sub ? sub : "";
-    if (s_nrows < 512) {
+    if (s_nrows >= 0 && s_nrows < RADIO_URL_SLOTS) {
         snprintf(s_radio_play_url[s_nrows], sizeof(s_radio_play_url[0]), "%s", url ? url : "");
     }
     if (url && url[0] && library_radio_fav_has(url)) {
@@ -927,7 +1309,6 @@ static void add_radio_row(const char *line, const char *sub, const char *url, in
 static void clamp_focus(void)
 {
     int vis;
-    float row_h = 72.f * s_scale;
     if (s_nrows <= 0) {
         s_focus = 0;
         s_scroll = 0;
@@ -939,10 +1320,7 @@ static void clamp_focus(void)
     if (s_focus >= s_nrows) {
         s_focus = s_nrows - 1;
     }
-    vis = (int)(((float)s_win_h - 180.f * s_scale) / row_h);
-    if (vis < 3) {
-        vis = 3;
-    }
+    vis = list_vis_rows();
     if (s_focus < s_scroll) {
         s_scroll = s_focus;
     }
@@ -1090,13 +1468,20 @@ void ui_refresh_lists(struct App *app)
     char sub[160];
     s_nrows = 0;
     (void)app;
+    library_queue_cover_refresh();
     switch (s_view) {
     case UI_VIEW_LIBRARY: {
         LibTrack resume;
         int pos = 0;
-        add_row("Resume",
-                library_resume_track(&resume, &pos) == 0 ? resume.title : "Nothing to resume",
-                1, UI_KIND_ACTION);
+        char rtitle[VIBE_NAME_MAX], rurl[VIBE_PATH_MAX], rsub[VIBE_NAME_MAX];
+        if (library_resume_radio(rtitle, (int)sizeof(rtitle), rurl, (int)sizeof(rurl),
+                                 rsub, (int)sizeof(rsub)) == 0 && rurl[0]) {
+            add_row("Resume", rtitle[0] ? rtitle : "Internet Radio", 1, UI_KIND_ACTION);
+        } else {
+            add_row("Resume",
+                    library_resume_track(&resume, &pos) == 0 ? resume.title : "Nothing to resume",
+                    1, UI_KIND_ACTION);
+        }
         snprintf(sub, sizeof(sub), "%d artists", library_artist_count());
         add_row("Artists", sub, 4, UI_KIND_ACTION);
         snprintf(sub, sizeof(sub), "%d albums", library_album_count());
@@ -1104,6 +1489,8 @@ void ui_refresh_lists(struct App *app)
         snprintf(sub, sizeof(sub), "%d folders", library_folder_count());
         add_row("Folders", sub, 5, UI_KIND_ACTION);
         add_row("Internet Radio", "Soma.fm, Radio Browser, Custom", 10, UI_KIND_ACTION);
+        snprintf(sub, sizeof(sub), "%d playlists", library_playlist_count());
+        add_row("Playlists", sub, 11, UI_KIND_ACTION);
         snprintf(sub, sizeof(sub), "%d tracks", library_queue_len());
         add_row("Current Queue", sub, 8, UI_KIND_ACTION);
         add_row("Search", "", 6, UI_KIND_ACTION);
@@ -1112,33 +1499,80 @@ void ui_refresh_lists(struct App *app)
         break;
     }
     case UI_VIEW_ALBUMS: {
-        int n = library_list_albums(s_qbuf.albums, VIBE_LIST_MAX, 0);
+        int n;
+        snprintf(sub, sizeof(sub), "%d albums", library_album_fav_count());
+        add_row("Favorites", sub, 1, UI_KIND_ACTION);
+        n = library_list_albums(s_qbuf.albums, VIBE_LIST_MAX, 0);
         for (int i = 0; i < n; i++) {
-            snprintf(sub, sizeof(sub), "%s  ·  %d tracks", s_qbuf.albums[i].artist, s_qbuf.albums[i].track_count);
+            if (library_album_fav_has(s_qbuf.albums[i].id)) {
+                snprintf(sub, sizeof(sub), "%s  ·  %d tracks  ·  Favorite",
+                         s_qbuf.albums[i].artist, s_qbuf.albums[i].track_count);
+            } else {
+                snprintf(sub, sizeof(sub), "%s  ·  %d tracks",
+                         s_qbuf.albums[i].artist, s_qbuf.albums[i].track_count);
+            }
+            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_album(s_qbuf.albums[i].id));
             add_row(s_qbuf.albums[i].name, sub, s_qbuf.albums[i].id, UI_KIND_ALBUM);
+        }
+        break;
+    }
+    case UI_VIEW_ALBUM_FAVORITES: {
+        int n = library_album_fav_list(s_qbuf.albums, VIBE_LIST_MAX);
+        for (int i = 0; i < n; i++) {
+            snprintf(sub, sizeof(sub), "%s  ·  %d tracks",
+                     s_qbuf.albums[i].artist, s_qbuf.albums[i].track_count);
+            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_album(s_qbuf.albums[i].id));
+            add_row(s_qbuf.albums[i].name, sub, s_qbuf.albums[i].id, UI_KIND_ALBUM);
+        }
+        if (n == 0) {
+            add_row("No favorites yet", "Hold A on an album to save it", 0, UI_KIND_ACTION);
         }
         break;
     }
     case UI_VIEW_ALBUM_TRACKS: {
         int n = library_album_tracks(s_ctx_album, s_qbuf.tracks, VIBE_LIST_MAX);
         for (int i = 0; i < n; i++) {
-            snprintf(sub, sizeof(sub), "%s", s_qbuf.tracks[i].artist);
-            add_row(s_qbuf.tracks[i].title, sub, s_qbuf.tracks[i].id, UI_KIND_TRACK);
+            add_track_row(s_qbuf.tracks[i].title, s_qbuf.tracks[i].artist, s_qbuf.tracks[i].id);
         }
         break;
     }
     case UI_VIEW_ARTISTS: {
-        int n = library_list_artists(s_qbuf.artists, VIBE_LIST_MAX, 0);
+        int n;
+        snprintf(sub, sizeof(sub), "%d artists", library_artist_fav_count());
+        add_row("Favorites", sub, 1, UI_KIND_ACTION);
+        n = library_list_artists(s_qbuf.artists, VIBE_LIST_MAX, 0);
+        for (int i = 0; i < n; i++) {
+            if (library_artist_fav_has(s_qbuf.artists[i].id)) {
+                snprintf(sub, sizeof(sub), "%d albums  ·  Favorite", s_qbuf.artists[i].album_count);
+            } else {
+                snprintf(sub, sizeof(sub), "%d albums", s_qbuf.artists[i].album_count);
+            }
+            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_artist(s_qbuf.artists[i].id));
+            add_row(s_qbuf.artists[i].name, sub, s_qbuf.artists[i].id, UI_KIND_ARTIST);
+        }
+        break;
+    }
+    case UI_VIEW_ARTIST_FAVORITES: {
+        int n = library_artist_fav_list(s_qbuf.artists, VIBE_LIST_MAX);
         for (int i = 0; i < n; i++) {
             snprintf(sub, sizeof(sub), "%d albums", s_qbuf.artists[i].album_count);
+            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_artist(s_qbuf.artists[i].id));
             add_row(s_qbuf.artists[i].name, sub, s_qbuf.artists[i].id, UI_KIND_ARTIST);
+        }
+        if (n == 0) {
+            add_row("No favorites yet", "Hold A on an artist to save it", 0, UI_KIND_ACTION);
         }
         break;
     }
     case UI_VIEW_ARTIST_ALBUMS: {
         int n = library_artist_albums(s_ctx_artist, s_qbuf.albums, VIBE_LIST_MAX);
         for (int i = 0; i < n; i++) {
-            snprintf(sub, sizeof(sub), "%d tracks", s_qbuf.albums[i].track_count);
+            if (library_album_fav_has(s_qbuf.albums[i].id)) {
+                snprintf(sub, sizeof(sub), "%d tracks  ·  Favorite", s_qbuf.albums[i].track_count);
+            } else {
+                snprintf(sub, sizeof(sub), "%d tracks", s_qbuf.albums[i].track_count);
+            }
+            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_album(s_qbuf.albums[i].id));
             add_row(s_qbuf.albums[i].name, sub, s_qbuf.albums[i].id, UI_KIND_ALBUM);
         }
         break;
@@ -1153,40 +1587,61 @@ void ui_refresh_lists(struct App *app)
             } else {
                 snprintf(sub, sizeof(sub), "Folder");
             }
+            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_folder(s_qbuf.folders[i].id));
             add_row(s_qbuf.folders[i].name, sub, s_qbuf.folders[i].id, UI_KIND_FOLDER);
         }
         n = library_folder_direct_tracks(s_ctx_folder, s_qbuf.tracks, VIBE_LIST_MAX);
         for (i = 0; i < n; i++) {
-            add_row(s_qbuf.tracks[i].title, s_qbuf.tracks[i].artist, s_qbuf.tracks[i].id, UI_KIND_TRACK);
+            add_track_row(s_qbuf.tracks[i].title, s_qbuf.tracks[i].artist, s_qbuf.tracks[i].id);
         }
         break;
     }
     case UI_VIEW_PLAYLISTS: {
-        int n = library_list_playlists(s_qbuf.playlists, VIBE_LIST_MAX);
-        if (n == 0) {
-            add_row("No playlists yet", "Saving playlists is not available yet", 0, UI_KIND_ACTION);
+        int n;
+        snprintf(sub, sizeof(sub), "%d playlists", library_playlist_fav_count());
+        add_row("Favorites", sub, 1, UI_KIND_ACTION);
+        n = library_list_playlists(s_qbuf.playlists, VIBE_LIST_MAX);
+        for (int i = 0; i < n; i++) {
+            if (library_playlist_fav_has(s_qbuf.playlists[i].id)) {
+                snprintf(sub, sizeof(sub), "%d tracks  ·  Favorite", s_qbuf.playlists[i].item_count);
+            } else {
+                snprintf(sub, sizeof(sub), "%d tracks", s_qbuf.playlists[i].item_count);
+            }
+            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_playlist(s_qbuf.playlists[i].id));
+            add_row(s_qbuf.playlists[i].name, sub, s_qbuf.playlists[i].id, UI_KIND_PLAYLIST);
         }
+        if (n == 0) {
+            add_row("No playlist files", "Put .m3u, .pls, .xspf, .wpl, .asx, or .cue in your music folders", 0, UI_KIND_ACTION);
+        }
+        break;
+    }
+    case UI_VIEW_PLAYLIST_FAVORITES: {
+        int n = library_playlist_fav_list(s_qbuf.playlists, VIBE_LIST_MAX);
         for (int i = 0; i < n; i++) {
             snprintf(sub, sizeof(sub), "%d tracks", s_qbuf.playlists[i].item_count);
+            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_playlist(s_qbuf.playlists[i].id));
             add_row(s_qbuf.playlists[i].name, sub, s_qbuf.playlists[i].id, UI_KIND_PLAYLIST);
+        }
+        if (n == 0) {
+            add_row("No favorites yet", "Hold A on a playlist to save it", 0, UI_KIND_ACTION);
         }
         break;
     }
     case UI_VIEW_PLAYLIST_TRACKS: {
         int n = library_playlist_tracks(s_ctx_playlist, s_qbuf.tracks, VIBE_LIST_MAX);
+        if (n == 0) {
+            add_row("No matching files", "Paths, filenames, and titles were checked against the library", 0, UI_KIND_ACTION);
+        }
         for (int i = 0; i < n; i++) {
-            add_row(s_qbuf.tracks[i].title, s_qbuf.tracks[i].artist, s_qbuf.tracks[i].id, UI_KIND_TRACK);
+            add_track_row(s_qbuf.tracks[i].title, s_qbuf.tracks[i].artist, s_qbuf.tracks[i].id);
         }
         break;
     }
     case UI_VIEW_QUEUE: {
         int n = library_queue_len();
-        add_row(app && app->shuffle ? "Shuffle  On" : "Shuffle  Off", "A  toggle", 100, UI_KIND_ACTION);
-        add_row(app && app->repeat == VIBE_REPEAT_ONE ? "Repeat  One" :
-                app && app->repeat == VIBE_REPEAT_ALL ? "Repeat  All" : "Repeat  Off",
-                "A  toggle", 101, UI_KIND_ACTION);
+        add_row("Queue Options", "Clear, save as playlist", 1, UI_KIND_ACTION);
         if (n == 0) {
-            add_row("Queue is empty", "X adds the focused album or track", 0, UI_KIND_ACTION);
+            add_row("Queue is empty", "Hold Y on a song, album, artist, or folder to add it", 0, UI_KIND_ACTION);
         }
         for (int i = 0; i < n; i++) {
             LibTrack t;
@@ -1198,16 +1653,21 @@ void ui_refresh_lists(struct App *app)
         }
         break;
     }
+    case UI_VIEW_QUEUE_OPTIONS:
+        add_row("Clear Queue", "Remove every song and stop playback", 1, UI_KIND_ACTION);
+        add_row("Save Queue to Playlist", "Write an .m3u in your music folder", 2, UI_KIND_ACTION);
+        break;
+    case UI_VIEW_QUEUE_SAVE:
+        s_show_kb = 1;
+        break;
     case UI_VIEW_SEARCH: {
         int n = 0;
         if (s_search[0]) {
             n = library_search(s_search, s_qbuf.tracks, 200);
         }
-        snprintf(sub, sizeof(sub), "Query: %s", s_search[0] ? s_search : "(type with the on-screen keys)");
-        add_row("Search", sub, 0, UI_KIND_ACTION);
         for (int i = 0; i < n; i++) {
             snprintf(sub, sizeof(sub), "%s  ·  %s", s_qbuf.tracks[i].artist, s_qbuf.tracks[i].album);
-            add_row(s_qbuf.tracks[i].title, sub, s_qbuf.tracks[i].id, UI_KIND_TRACK);
+            add_track_row(s_qbuf.tracks[i].title, sub, s_qbuf.tracks[i].id);
         }
         s_show_kb = 1;
         break;
@@ -1368,8 +1828,6 @@ void ui_refresh_lists(struct App *app)
         break;
     }
     case UI_VIEW_RADIO_ADD:
-        snprintf(sub, sizeof(sub), "URL: %s", s_radio_url[0] ? s_radio_url : "(type with the on-screen keys)");
-        add_row("Save station", sub, 1, UI_KIND_ACTION);
         s_show_kb = 1;
         break;
     default:
@@ -1583,6 +2041,10 @@ static void fmt_time(char *buf, size_t n, double sec)
 
 static void draw_np_chip(float x, float y, float w, float h, int focused, const char *label)
 {
+    float sc = 0.6f;
+    float tw;
+    float tx;
+    float ty;
     if (focused) {
         draw_rect(x, y, w, h, 1, 1, 1, 0.18f);
         draw_rect(x, y, 5.f * s_scale, h, 1, 1, 1, 0.95f);
@@ -1590,7 +2052,10 @@ static void draw_np_chip(float x, float y, float w, float h, int focused, const 
         draw_rect(x, y, w, h, 0, 0, 0, 0.22f);
     }
     flush_color();
-    draw_text(x + 16.f * s_scale, y + 26.f * s_scale, label, 0.6f, 0.92f, 0.92f, 0.92f, 1.f);
+    tw = measure_text(label ? label : "", sc);
+    tx = x + (w - tw) * 0.5f;
+    ty = y + h * 0.5f + 8.f * s_scale;
+    draw_text(tx, ty, label ? label : "", sc, 0.92f, 0.92f, 0.92f, 1.f);
     flush_font();
 }
 
@@ -1762,7 +2227,8 @@ static void draw_now_playing(struct App *app)
         float chip_h = 36.f * s_scale;
         float sq = chip_h;
         float lock_w = 300.f * s_scale;
-        float shuf_w = 180.f * s_scale;
+        float shuf_w = 150.f * s_scale;
+        float rep_w = 150.f * s_scale;
         float gap = 12.f * s_scale;
         float sq_gap = 8.f * s_scale;
         float x_prev = bar_x;
@@ -1770,7 +2236,8 @@ static void draw_now_playing(struct App *app)
         float x_stop = x_play + sq + sq_gap;
         float x_next = x_stop + sq + sq_gap;
         float x_shuf = x_next + sq + gap;
-        float x_vol = x_shuf + shuf_w + gap;
+        float x_rep = x_shuf + shuf_w + gap;
+        float x_vol = x_rep + rep_w + gap;
         float left_end = x_vol + sq;
         float x_lock = bar_x + bar_w - lock_w;
         float x_eye = x_lock - gap - sq;
@@ -1800,6 +2267,9 @@ static void draw_now_playing(struct App *app)
         flush_color();
         draw_np_chip(x_shuf, opt_y, shuf_w, chip_h, s_np_opt == NP_OPT_SHUFFLE,
                      app->shuffle ? "Shuffle  On" : "Shuffle  Off");
+        draw_np_chip(x_rep, opt_y, rep_w, chip_h, s_np_opt == NP_OPT_REPEAT,
+                     app->repeat == VIBE_REPEAT_ONE ? "Repeat  One" :
+                     app->repeat == VIBE_REPEAT_ALL ? "Repeat  All" : "Repeat  Off");
         draw_np_square(x_vol, opt_y, sq, s_np_opt == NP_OPT_VOLUME);
         icon_speaker(x_vol, opt_y, sq);
         flush_color();
@@ -1872,17 +2342,27 @@ static const char *heading(void)
         return "Album";
     case UI_VIEW_ARTISTS:
         return "Artists";
+    case UI_VIEW_ARTIST_FAVORITES:
+        return "Favorite artists";
     case UI_VIEW_ARTIST_ALBUMS:
         return "Artist";
+    case UI_VIEW_ALBUM_FAVORITES:
+        return "Favorite albums";
     case UI_VIEW_FOLDERS:
     case UI_VIEW_FOLDER_TRACKS:
         return s_folder_title[0] ? s_folder_title : "Folders";
     case UI_VIEW_PLAYLISTS:
         return "Playlists";
+    case UI_VIEW_PLAYLIST_FAVORITES:
+        return "Favorite playlists";
     case UI_VIEW_PLAYLIST_TRACKS:
         return "Playlist";
     case UI_VIEW_QUEUE:
         return "Queue";
+    case UI_VIEW_QUEUE_OPTIONS:
+        return "Queue Options";
+    case UI_VIEW_QUEUE_SAVE:
+        return "Save Playlist";
     case UI_VIEW_SEARCH:
         return "Search";
     case UI_VIEW_SETTINGS:
@@ -1933,6 +2413,145 @@ static const char *heading(void)
 static int uses_letter_jump(void);
 static uint32_t row_code(int i);
 
+static void draw_kb_field(void)
+{
+    float x, y, w, h, pad, text_sc, tw, caret_x, scroll;
+    float br, bg, bb;
+    const char *buf = kb_buf();
+    const char *shown;
+    char prefix[VIBE_PATH_MAX];
+    int field_hot = s_kb_active && s_kb_zone == KB_ZONE_FIELD;
+    int blink = ((SDL_GetTicks() / 530) & 1) == 0;
+    int dw = 0, dh = 0;
+    float sx, sy;
+    int gx, gy, gw, gh;
+    size_t n, caret;
+    kb_field_geom(&x, &y, &w, &h);
+    kb_clamp_caret();
+    caret = s_kb_caret;
+    n = strlen(buf);
+    if (caret > n) {
+        caret = n;
+    }
+    if (caret >= sizeof(prefix)) {
+        caret = sizeof(prefix) - 1;
+    }
+    memcpy(prefix, buf, caret);
+    prefix[caret] = '\0';
+    pad = 18.f * s_scale;
+    text_sc = 0.95f;
+    br = field_hot ? 0.10f : 0.55f;
+    bg = field_hot ? 0.10f : 0.55f;
+    bb = field_hot ? 0.10f : 0.55f;
+    {
+        float b = field_hot ? 4.f * s_scale : 2.f * s_scale;
+        draw_rect(x - b, y - b, w + 2.f * b, h + 2.f * b, br, bg, bb, 1.f);
+        draw_rect(x, y, w, h, 1.f, 1.f, 1.f, 1.f);
+        flush_color();
+    }
+    shown = (buf[0] != '\0') ? buf : kb_placeholder();
+    tw = measure_text(prefix, text_sc);
+    scroll = 0.f;
+    if (tw > w - pad * 2.f - 8.f * s_scale) {
+        scroll = tw - (w - pad * 2.f - 8.f * s_scale);
+    }
+    plat_drawable_size(&dw, &dh);
+    if (dw <= 0) {
+        dw = s_win_w;
+    }
+    if (dh <= 0) {
+        dh = s_win_h;
+    }
+    sx = (float)dw / (float)s_win_w;
+    sy = (float)dh / (float)s_win_h;
+    gx = (int)(x * sx);
+    gy = (int)(((float)s_win_h - (y + h)) * sy);
+    gw = (int)(w * sx);
+    gh = (int)(h * sy);
+    if (gw < 1) {
+        gw = 1;
+    }
+    if (gh < 1) {
+        gh = 1;
+    }
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(gx, gy, gw, gh);
+    if (buf[0]) {
+        draw_text(x + pad - scroll, y + h * 0.66f, shown, text_sc, 0.10f, 0.10f, 0.10f, 1.f);
+    } else {
+        draw_text(x + pad, y + h * 0.66f, shown, text_sc, 0.45f, 0.45f, 0.48f, 1.f);
+    }
+    flush_font();
+    caret_x = x + pad - scroll + tw;
+    if (s_kb_active && (field_hot || blink)) {
+        draw_rect(caret_x, y + 14.f * s_scale, 3.f * s_scale, h - 28.f * s_scale,
+                  0.10f, 0.10f, 0.12f, field_hot ? 1.f : 0.85f);
+        flush_color();
+    }
+    glDisable(GL_SCISSOR_TEST);
+}
+
+static void draw_keyboard(void)
+{
+    const KbKey *keys = kb_cur();
+    int n = kb_count();
+    float cell = 56.f * s_scale;
+    float kb_w = (float)KB_COLS * cell;
+    float kx = ((float)s_win_w - kb_w) * 0.5f;
+    float ky = (float)s_win_h - 318.f * s_scale;
+    float row_h = 48.f * s_scale;
+    int i, keys_hot;
+    if (kx < 24.f * s_scale) {
+        kx = 24.f * s_scale;
+    }
+    keys_hot = s_kb_active && s_kb_zone == KB_ZONE_KEYS;
+    if (s_kb_i < 0 || s_kb_i >= n) {
+        s_kb_i = 0;
+    }
+    for (i = 0; i < n; i++) {
+        float x = kx + (float)keys[i].col * cell;
+        float y = ky + (float)keys[i].row * row_h;
+        float w = (float)keys[i].span * cell - 8.f * s_scale;
+        float h = 42.f * s_scale;
+        float kr = 0.f, kg = 0.f, kb = 0.f, ka = 0.38f;
+        char lab[32];
+        float tsc, tw, tx;
+        int engaged = 0;
+        if (keys[i].special == KB_SPEC_SHIFT && s_kb_shift) {
+            engaged = 1;
+        }
+        if (keys[i].special == KB_SPEC_SYMS && s_kb_sym) {
+            engaged = 1;
+        }
+        if (keys_hot && i == s_kb_i) {
+            kr = 1.f;
+            kg = 1.f;
+            kb = 1.f;
+            ka = 0.30f;
+        } else if (engaged) {
+            kr = 1.f;
+            kg = 1.f;
+            kb = 1.f;
+            ka = 0.16f;
+        }
+        draw_rect(x, y, w, h, kr, kg, kb, ka);
+        flush_color();
+        kb_key_label(&keys[i], lab, sizeof(lab));
+        tsc = (keys[i].special == KB_SPEC_STEAM) ? 0.55f : 0.62f;
+        tw = measure_text(lab, tsc);
+        while (tsc > 0.40f && tw > w - 10.f * s_scale) {
+            tsc -= 0.04f;
+            tw = measure_text(lab, tsc);
+        }
+        tx = x + (w - tw) * 0.5f;
+        if (tx < x + 6.f * s_scale) {
+            tx = x + 6.f * s_scale;
+        }
+        draw_text(tx, y + 28.f * s_scale, lab, tsc, 1.f, 1.f, 1.f, 1.f);
+        flush_font();
+    }
+}
+
 static void draw_list(struct App *app)
 {
     float top = 110.f * s_scale;
@@ -1940,21 +2559,23 @@ static void draw_list(struct App *app)
     float left = 64.f * s_scale;
     float width = (float)s_win_w - 128.f * s_scale;
     int vis;
-    float kb_reserve = 0.f;
     (void)app;
     if (kb_on()) {
-        kb_reserve = 310.f * s_scale;
+        float fx, fy, fw, fh;
+        kb_field_geom(&fx, &fy, &fw, &fh);
+        top = fy + fh + 16.f * s_scale;
     }
-    vis = (int)(((float)s_win_h - top - 80.f * s_scale - kb_reserve) / row_h);
-    if (vis < 3) {
-        vis = 3;
-    }
+    vis = list_vis_rows();
 
     draw_rect(32.f * s_scale, 24.f * s_scale, (float)s_win_w - 64.f * s_scale,
               (float)s_win_h - 48.f * s_scale, 0.f, 0.f, 0.f, s_veil);
     flush_color();
     draw_text(left, 80.f * s_scale, heading(), 1.35f, 0.96f, 0.96f, 0.96f, 1.f);
     flush_font();
+
+    if (kb_on()) {
+        draw_kb_field();
+    }
 
     for (int i = 0; i < vis; i++) {
         int idx = s_scroll + i;
@@ -1963,7 +2584,7 @@ static void draw_list(struct App *app)
             break;
         }
         y = top + (float)i * row_h;
-        if (idx == s_focus) {
+        if (idx == s_focus && !(kb_on() && s_kb_active)) {
             draw_rect(left - 12.f * s_scale, y, width + 24.f * s_scale, row_h - 8.f * s_scale,
                       1, 1, 1, 0.10f);
             draw_rect(left - 12.f * s_scale, y, 6.f * s_scale, row_h - 8.f * s_scale,
@@ -1991,24 +2612,7 @@ static void draw_list(struct App *app)
     }
 
     if (kb_on()) {
-        float cell = 52.f * s_scale;
-        float kx = 64.f * s_scale;
-        float ky = (float)s_win_h - 300.f * s_scale;
-        int i;
-        for (i = 0; i < KB_N; i++) {
-            float x = kx + (float)k_keys[i].col * cell;
-            float y = ky + (float)k_keys[i].row * 46.f * s_scale;
-            float w = (float)k_keys[i].span * cell - 8.f * s_scale;
-            float h = 40.f * s_scale;
-            if (i == s_kb_i) {
-                draw_rect(x, y, w, h, 1, 1, 1, 0.25f);
-            } else {
-                draw_rect(x, y, w, h, 0, 0, 0, 0.35f);
-            }
-            flush_color();
-            draw_text(x + 10.f * s_scale, y + 28.f * s_scale, k_keys[i].label, 0.65f, 1, 1, 1, 1);
-            flush_font();
-        }
+        draw_keyboard();
     }
 
     if (uses_letter_jump() && s_nrows > 0 && s_focus >= 0) {
@@ -2028,9 +2632,12 @@ static int uses_letter_jump(void)
 {
     switch (s_view) {
     case UI_VIEW_ALBUMS:
+    case UI_VIEW_ALBUM_FAVORITES:
     case UI_VIEW_ARTISTS:
+    case UI_VIEW_ARTIST_FAVORITES:
     case UI_VIEW_FOLDERS:
     case UI_VIEW_PLAYLISTS:
+    case UI_VIEW_PLAYLIST_FAVORITES:
     case UI_VIEW_ALBUM_TRACKS:
     case UI_VIEW_ARTIST_ALBUMS:
     case UI_VIEW_FOLDER_TRACKS:
@@ -2061,7 +2668,8 @@ static uint32_t row_code(int i)
     while (*s == ' ') {
         s++;
     }
-    if (s_view == UI_VIEW_ALBUMS || s_view == UI_VIEW_ARTIST_ALBUMS) {
+    if (s_view == UI_VIEW_ALBUMS || s_view == UI_VIEW_ARTIST_ALBUMS ||
+        s_view == UI_VIEW_ALBUM_FAVORITES) {
         if (strncasecmp(s, "the ", 4) == 0) {
             s += 4;
         } else if (strncasecmp(s, "a ", 2) == 0) {
@@ -2144,6 +2752,8 @@ static int play_focused_track(struct App *app, int64_t id)
     }
     if (s_view == UI_VIEW_ALBUM_TRACKS || s_view == UI_VIEW_ALBUMS) {
         library_queue_play_album_from(t.album_id, t.id);
+    } else if (s_view == UI_VIEW_PLAYLIST_TRACKS || s_view == UI_VIEW_PLAYLISTS) {
+        library_queue_play_playlist_from(s_ctx_playlist, t.id);
     } else if (s_view == UI_VIEW_FOLDER_TRACKS || s_view == UI_VIEW_FOLDERS) {
         library_queue_play_folder_from(t.folder_id, t.id);
     } else if (s_view == UI_VIEW_QUEUE) {
@@ -2178,6 +2788,208 @@ static int play_focused_track(struct App *app, int64_t id)
     return 0;
 }
 
+static void draw_quit_prompt(void)
+{
+    const char *title = "Quit StOMP?";
+    const char *hint = "B again to quit.";
+    const char *stay = "No! I want to keep StOMPing!";
+    const char *quit = "Quit";
+    float pad = 48.f * s_scale;
+    float gap = 16.f * s_scale;
+    float bh = 56.f * s_scale;
+    float sc = 0.6f;
+    float stay_w = measure_text(stay, sc) + 48.f * s_scale;
+    float quit_w = measure_text(quit, sc) + 48.f * s_scale;
+    float w;
+    float h = 280.f * s_scale;
+    float x, y, by, stay_x, quit_x;
+    if (stay_w < 280.f * s_scale) {
+        stay_w = 280.f * s_scale;
+    }
+    if (quit_w < 140.f * s_scale) {
+        quit_w = 140.f * s_scale;
+    }
+    w = pad * 2.f + stay_w + gap + quit_w;
+    if (w < 640.f * s_scale) {
+        w = 640.f * s_scale;
+    }
+    x = ((float)s_win_w - w) * 0.5f;
+    y = ((float)s_win_h - h) * 0.5f;
+    by = y + h - 88.f * s_scale;
+    stay_x = x + pad;
+    quit_x = x + w - pad - quit_w;
+    draw_rect(0, 0, (float)s_win_w, (float)s_win_h, 0.f, 0.f, 0.f, 0.55f);
+    draw_rect(x, y, w, h, 0.04f, 0.05f, 0.07f, 0.94f);
+    flush_color();
+    draw_text(x + (w - measure_text(title, 1.05f)) * 0.5f, y + 72.f * s_scale,
+              title, 1.05f, 0.96f, 0.96f, 0.96f, 1.f);
+    draw_text(x + (w - measure_text(hint, 0.55f)) * 0.5f, y + 118.f * s_scale,
+              hint, 0.55f, 0.7f, 0.7f, 0.7f, 1.f);
+    flush_font();
+    draw_np_chip(stay_x, by, stay_w, bh, s_quit_choice == 0, stay);
+    draw_np_chip(quit_x, by, quit_w, bh, s_quit_choice == 1, quit);
+}
+
+static void open_quit_prompt(void)
+{
+    s_quit_prompt = 1;
+    s_quit_choice = 0;
+    s_overlay = 1;
+    s_idle_on = 0;
+}
+
+static int queue_focus_index(void)
+{
+    int i, qi = 0;
+    if (s_view != UI_VIEW_QUEUE || s_focus < 0 || s_focus >= s_nrows) {
+        return -1;
+    }
+    if (s_rows[s_focus].kind != UI_KIND_TRACK) {
+        return -1;
+    }
+    for (i = 0; i < s_focus; i++) {
+        if (s_rows[i].kind == UI_KIND_TRACK) {
+            qi++;
+        }
+    }
+    return qi;
+}
+
+static void after_queue_remove(struct App *app, int removed_current)
+{
+    if (library_queue_len() <= 0) {
+        app_halt(app);
+        snprintf(app->status, sizeof(app->status), "Queue cleared");
+        return;
+    }
+    if (removed_current && !app->playing_radio) {
+        app_play_queue_index(app, library_queue_index());
+    }
+}
+
+static void queue_remove_index(struct App *app, int qi)
+{
+    int cur = library_queue_index();
+    int playing = qi == cur && app->now_valid && !app->playing_radio;
+    if (library_queue_remove(qi) != 0) {
+        return;
+    }
+    snprintf(app->status, sizeof(app->status), "Removed from queue");
+    after_queue_remove(app, playing);
+    ui_refresh_lists(app);
+}
+
+static void queue_remove_track_id(struct App *app, int64_t track_id)
+{
+    int playing = app->now_valid && !app->playing_radio && app->now.id == track_id;
+    int n = library_queue_remove_track(track_id);
+    if (n <= 0) {
+        snprintf(app->status, sizeof(app->status), "Not in queue");
+        return;
+    }
+    snprintf(app->status, sizeof(app->status), n == 1 ? "Removed from queue" : "Removed %d from queue", n);
+    after_queue_remove(app, playing);
+    ui_refresh_lists(app);
+}
+
+static void queue_append_focus(struct App *app)
+{
+    int n = 0;
+    if (s_focus < 0 || s_focus >= s_nrows) {
+        return;
+    }
+    switch (s_rows[s_focus].kind) {
+    case UI_KIND_TRACK:
+        n = library_queue_add(s_rows[s_focus].id) == 0 ? 1 : 0;
+        break;
+    case UI_KIND_ALBUM:
+        n = library_queue_add_album(s_rows[s_focus].id);
+        break;
+    case UI_KIND_ARTIST:
+        n = library_queue_add_artist(s_rows[s_focus].id);
+        break;
+    case UI_KIND_FOLDER:
+        n = library_queue_add_folder(s_rows[s_focus].id);
+        break;
+    case UI_KIND_PLAYLIST:
+        n = library_queue_add_playlist(s_rows[s_focus].id);
+        break;
+    default:
+        return;
+    }
+    if (n <= 0) {
+        snprintf(app->status, sizeof(app->status),
+                 library_queue_len() >= VIBE_QUEUE_MAX ? "Queue is full" : "Nothing to add");
+        return;
+    }
+    snprintf(app->status, sizeof(app->status), n == 1 ? "Added to queue" : "Added %d to queue", n);
+    ui_refresh_lists(app);
+}
+
+static void playlist_filename(const char *name, char *out, size_t n)
+{
+    size_t j = 0;
+    const char *p;
+    if (!out || n == 0) {
+        return;
+    }
+    out[0] = '\0';
+    for (p = name ? name : ""; *p && j + 1 < n; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c < 32) {
+            continue;
+        }
+        if (strchr("/\\:*?\"<>|", (int)c)) {
+            out[j++] = '_';
+        } else {
+            out[j++] = (char)c;
+        }
+    }
+    out[j] = '\0';
+    while (j > 0 && (out[j - 1] == ' ' || out[j - 1] == '.' || out[j - 1] == '_')) {
+        out[--j] = '\0';
+    }
+    if (!out[0]) {
+        snprintf(out, n, "Queue");
+    }
+}
+
+static int save_queue_playlist(struct App *app)
+{
+    char file[VIBE_NAME_MAX];
+    char path[VIBE_PATH_MAX];
+    const char *dir;
+    size_t n;
+    if (!app) {
+        return -1;
+    }
+    if (library_queue_len() <= 0) {
+        snprintf(app->status, sizeof(app->status), "Queue is empty");
+        return -1;
+    }
+    if (app->cfg.music_dir_count <= 0 || !app->cfg.music_dirs[0][0]) {
+        snprintf(app->status, sizeof(app->status), "Set a music folder first");
+        return -1;
+    }
+    playlist_filename(s_pl_name, file, sizeof(file));
+    n = strlen(file);
+    if (n < 4 || strcasecmp(file + n - 4, ".m3u") != 0) {
+        if (n + 4 >= sizeof(file)) {
+            file[sizeof(file) - 5] = '\0';
+            n = strlen(file);
+        }
+        snprintf(file + n, sizeof(file) - n, ".m3u");
+    }
+    dir = app->cfg.music_dirs[0];
+    snprintf(path, sizeof(path), "%s/%s", dir, file);
+    if (library_queue_export_m3u(path, s_pl_name[0] ? s_pl_name : file) != 0) {
+        snprintf(app->status, sizeof(app->status), "Could not save playlist");
+        return -1;
+    }
+    snprintf(app->status, sizeof(app->status), "Saved %s", file);
+    return 0;
+}
+
 static void list_step(int dir, int repeat)
 {
     if (s_nrows <= 0) {
@@ -2201,26 +3013,81 @@ static void list_step(int dir, int repeat)
 int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
 {
     (void)seek_axis;
+    if (s_quit_prompt) {
+        switch (cmd) {
+        case VIBE_CMD_LEFT:
+            s_quit_choice = 0;
+            return 1;
+        case VIBE_CMD_RIGHT:
+            s_quit_choice = 1;
+            return 1;
+        case VIBE_CMD_UP:
+        case VIBE_CMD_DOWN:
+            s_quit_choice = !s_quit_choice;
+            return 1;
+        case VIBE_CMD_CONFIRM:
+            if (s_quit_choice) {
+                app_persist(app);
+                app->running = 0;
+            }
+            s_quit_prompt = 0;
+            return 1;
+        case VIBE_CMD_BACK:
+            app_persist(app);
+            app->running = 0;
+            s_quit_prompt = 0;
+            return 1;
+        case VIBE_CMD_LIBRARY:
+            s_quit_prompt = 0;
+            return 1;
+        default:
+            return 1;
+        }
+    }
     switch (cmd) {
     case VIBE_CMD_CONFIRM_HOLD:
-        if (s_radio_pending && s_focus >= 0 && s_focus < s_nrows &&
-            s_rows[s_focus].kind == UI_KIND_RADIO) {
-            const char *url = s_focus < 512 ? s_radio_play_url[s_focus] : "";
-            int on = library_radio_fav_toggle(s_rows[s_focus].line, url, s_rows[s_focus].sub);
-            s_radio_hold_did = 1;
-            snprintf(app->status, sizeof(app->status),
-                     on > 0 ? "Favorite" : "Removed from favorites");
-            ui_refresh_lists(app);
+        if (s_hold_kind && s_focus >= 0 && s_focus < s_nrows) {
+            int on = -1;
+            if (s_rows[s_focus].kind == UI_KIND_RADIO) {
+                const char *url = (s_focus >= 0 && s_focus < RADIO_URL_SLOTS) ? s_radio_play_url[s_focus] : "";
+                on = library_radio_fav_toggle(s_rows[s_focus].line, url, s_rows[s_focus].sub);
+            } else if (s_rows[s_focus].kind == UI_KIND_ARTIST) {
+                on = library_artist_fav_toggle(s_rows[s_focus].id);
+            } else if (s_rows[s_focus].kind == UI_KIND_ALBUM) {
+                on = library_album_fav_toggle(s_rows[s_focus].id);
+            } else if (s_rows[s_focus].kind == UI_KIND_PLAYLIST) {
+                on = library_playlist_fav_toggle(s_rows[s_focus].id);
+            }
+            if (on >= 0) {
+                s_hold_did = 1;
+                snprintf(app->status, sizeof(app->status),
+                         on > 0 ? "Favorite" : "Removed from favorites");
+                ui_refresh_lists(app);
+            }
         }
         return 1;
     case VIBE_CMD_CONFIRM_UP:
-        if (s_radio_pending && !s_radio_hold_did &&
-            s_focus >= 0 && s_focus < s_nrows && s_rows[s_focus].kind == UI_KIND_RADIO) {
-            const char *url = s_focus < 512 ? s_radio_play_url[s_focus] : "";
-            app_play_radio(app, s_rows[s_focus].line, url, s_rows[s_focus].sub);
+        if (s_hold_kind && !s_hold_did &&
+            s_focus >= 0 && s_focus < s_nrows) {
+            if (s_rows[s_focus].kind == UI_KIND_RADIO) {
+                const char *url = (s_focus >= 0 && s_focus < RADIO_URL_SLOTS) ? s_radio_play_url[s_focus] : "";
+                app_play_radio(app, s_rows[s_focus].line, url, s_rows[s_focus].sub);
+            } else if (s_rows[s_focus].kind == UI_KIND_ARTIST) {
+                s_ctx_artist = s_rows[s_focus].id;
+                push_view(UI_VIEW_ARTIST_ALBUMS);
+                ui_refresh_lists(app);
+            } else if (s_rows[s_focus].kind == UI_KIND_ALBUM) {
+                s_ctx_album = s_rows[s_focus].id;
+                push_view(UI_VIEW_ALBUM_TRACKS);
+                ui_refresh_lists(app);
+            } else if (s_rows[s_focus].kind == UI_KIND_PLAYLIST) {
+                s_ctx_playlist = s_rows[s_focus].id;
+                push_view(UI_VIEW_PLAYLIST_TRACKS);
+                ui_refresh_lists(app);
+            }
         }
-        s_radio_pending = 0;
-        s_radio_hold_did = 0;
+        s_hold_kind = 0;
+        s_hold_did = 0;
         return 1;
     case VIBE_CMD_LIBRARY:
         s_folder_sp = 0;
@@ -2258,7 +3125,9 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             }
             if (s_overlay) {
                 ui_hide_overlay();
+                return 1;
             }
+            open_quit_prompt();
             return 1;
         }
         if ((s_view == UI_VIEW_FOLDERS || s_view == UI_VIEW_FOLDER_TRACKS) && s_folder_sp > 0) {
@@ -2301,8 +3170,12 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             s_np_opt = 1;
             return 1;
         }
-        if (kb_on() && s_kb_active) {
-            kb_move(-1, 0);
+        if (kb_nav(-1, 0)) {
+            return 1;
+        }
+        if (kb_on() && !s_kb_active && s_focus <= 0) {
+            s_kb_active = 1;
+            s_kb_zone = KB_ZONE_FIELD;
             return 1;
         }
         list_step(-1, repeat);
@@ -2320,8 +3193,12 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             s_np_opt = 0;
             return 1;
         }
-        if (kb_on() && s_kb_active) {
-            kb_move(1, 0);
+        if (kb_nav(1, 0)) {
+            return 1;
+        }
+        if (kb_on() && !s_kb_active && s_nrows > 0 && s_focus >= s_nrows - 1 && !repeat) {
+            s_kb_active = 1;
+            s_kb_zone = KB_ZONE_KEYS;
             return 1;
         }
         list_step(1, repeat);
@@ -2333,8 +3210,7 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             }
             return 1;
         }
-        if (kb_on() && s_kb_active) {
-            kb_move(0, -1);
+        if (kb_nav(0, -1)) {
             return 1;
         }
         letter_jump(-1);
@@ -2346,17 +3222,24 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             }
             return 1;
         }
-        if (kb_on() && s_kb_active) {
-            kb_move(0, 1);
+        if (kb_nav(0, 1)) {
             return 1;
         }
         letter_jump(1);
         return 1;
     case VIBE_CMD_PAGE_UP:
+        if (kb_on() && s_kb_active) {
+            s_kb_caret = 0;
+            return 1;
+        }
         s_focus -= 8;
         clamp_focus();
         return 1;
     case VIBE_CMD_PAGE_DOWN:
+        if (kb_on() && s_kb_active) {
+            s_kb_caret = strlen(kb_buf());
+            return 1;
+        }
         s_focus += 8;
         clamp_focus();
         return 1;
@@ -2380,6 +3263,8 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
                 app_next_track(app, 0);
             } else if (s_np_opt == NP_OPT_SHUFFLE) {
                 app->shuffle = !app->shuffle;
+            } else if (s_np_opt == NP_OPT_REPEAT) {
+                app->repeat = (VibeRepeat)(((int)app->repeat + 1) % 3);
             } else if (s_np_opt == NP_OPT_VOLUME) {
                 s_vol_saved = audio_volume();
                 s_vol_draft = s_vol_saved;
@@ -2398,40 +3283,75 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             return 1;
         }
         if (kb_on() && s_kb_active) {
-            const KbKey *k = &k_keys[s_kb_i];
-            char *buf = kb_buf();
-            size_t cap = kb_cap();
-            if (k->special == 1) {
-                size_t n = strlen(buf);
-                if (n > 0) {
-                    buf[n - 1] = '\0';
-                }
-            } else if (k->special == 2) {
-                buf[0] = '\0';
-            } else if (k->special == 3) {
-                if (s_view == UI_VIEW_RADIO_ADD && s_radio_url[0]) {
+            const KbKey *keys = kb_cur();
+            const KbKey *k;
+            int n = kb_count();
+            if (s_kb_zone == KB_ZONE_FIELD) {
+                open_steam_keyboard();
+                snprintf(app->status, sizeof(app->status), "Steam keyboard");
+                return 1;
+            }
+            if (s_kb_i < 0 || s_kb_i >= n) {
+                s_kb_i = 0;
+            }
+            k = &keys[s_kb_i];
+            if (k->special == KB_SPEC_BKSP) {
+                kb_backspace();
+            } else if (k->special == KB_SPEC_CLEAR) {
+                kb_clear();
+            } else if (k->special == KB_SPEC_DONE) {
+                if (s_view == UI_VIEW_RADIO_ADD) {
                     char name[VIBE_NAME_MAX];
+                    if (!s_radio_url[0]) {
+                        return 1;
+                    }
                     radio_name_from_url(s_radio_url, name, (int)sizeof(name));
-                    library_radio_custom_add(name, s_radio_url);
+                    if (library_radio_custom_add(name, s_radio_url) == 0) {
+                        snprintf(app->status, sizeof(app->status), "Saved");
+                    } else {
+                        snprintf(app->status, sizeof(app->status), "Could not save");
+                    }
                     pop_view();
                     ui_refresh_lists(app);
                     return 1;
                 }
-                s_kb_active = 0;
-                s_focus = (s_nrows > 1) ? 1 : 0;
+                if (s_view == UI_VIEW_QUEUE_SAVE) {
+                    if (save_queue_playlist(app) == 0) {
+                        pop_view();
+                        pop_view();
+                        ui_refresh_lists(app);
+                    }
+                    return 1;
+                }
+                if (s_nrows > 0) {
+                    s_kb_active = 0;
+                    s_focus = 0;
+                    clamp_focus();
+                }
+                return 1;
+            } else if (k->special == KB_SPEC_SHIFT) {
+                s_kb_shift = !s_kb_shift;
+                return 1;
+            } else if (k->special == KB_SPEC_SYMS) {
+                s_kb_sym = !s_kb_sym;
+                return 1;
+            } else if (k->special == KB_SPEC_STEAM) {
+                open_steam_keyboard();
+                snprintf(app->status, sizeof(app->status), "Steam keyboard");
                 return 1;
             } else {
-                size_t n = strlen(buf);
-                if (n + 1 < cap) {
-                    buf[n] = k->ch;
-                    buf[n + 1] = '\0';
+                char tmp[2];
+                char c = k->ch;
+                if (!s_kb_sym && c >= 'a' && c <= 'z' && s_kb_shift) {
+                    c = (char)(c - 'a' + 'A');
                 }
+                tmp[0] = c;
+                tmp[1] = '\0';
+                kb_insert(tmp);
             }
-            ui_refresh_lists(app);
-            return 1;
-        }
-        if (s_view == UI_VIEW_SEARCH && !s_kb_active && s_focus == 0) {
-            s_kb_active = 1;
+            if (s_view == UI_VIEW_SEARCH) {
+                ui_refresh_lists(app);
+            }
             return 1;
         }
         if (s_focus < 0 || s_focus >= s_nrows) {
@@ -2457,14 +3377,15 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             case 10:
                 push_view(UI_VIEW_RADIO);
                 break;
+            case 11:
+                push_view(UI_VIEW_PLAYLISTS);
+                break;
             case 8:
                 push_view(UI_VIEW_QUEUE);
                 break;
             case 6:
                 push_view(UI_VIEW_SEARCH);
-                s_show_kb = 1;
-                s_kb_active = 1;
-                s_kb_i = 0;
+                kb_reset();
                 break;
             case 7:
                 push_view(UI_VIEW_SETTINGS);
@@ -2517,10 +3438,8 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         if (s_view == UI_VIEW_RADIO_CUSTOM && s_rows[s_focus].kind == UI_KIND_ACTION &&
             s_rows[s_focus].id == 1) {
             s_radio_url[0] = '\0';
-            s_show_kb = 1;
-            s_kb_active = 1;
-            s_kb_i = 0;
             push_view(UI_VIEW_RADIO_ADD);
+            kb_reset();
             ui_refresh_lists(app);
             return 1;
         }
@@ -2539,9 +3458,27 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             ui_refresh_lists(app);
             return 1;
         }
+        if (s_view == UI_VIEW_ARTISTS && s_rows[s_focus].kind == UI_KIND_ACTION &&
+            s_rows[s_focus].id == 1) {
+            push_view(UI_VIEW_ARTIST_FAVORITES);
+            ui_refresh_lists(app);
+            return 1;
+        }
+        if (s_view == UI_VIEW_ALBUMS && s_rows[s_focus].kind == UI_KIND_ACTION &&
+            s_rows[s_focus].id == 1) {
+            push_view(UI_VIEW_ALBUM_FAVORITES);
+            ui_refresh_lists(app);
+            return 1;
+        }
+        if (s_view == UI_VIEW_PLAYLISTS && s_rows[s_focus].kind == UI_KIND_ACTION &&
+            s_rows[s_focus].id == 1) {
+            push_view(UI_VIEW_PLAYLIST_FAVORITES);
+            ui_refresh_lists(app);
+            return 1;
+        }
         if (s_rows[s_focus].kind == UI_KIND_RADIO) {
-            s_radio_pending = 1;
-            s_radio_hold_did = 0;
+            s_hold_kind = UI_KIND_RADIO;
+            s_hold_did = 0;
             return 1;
         }
         if (s_view == UI_VIEW_MUSIC_DIRS) {
@@ -2584,15 +3521,13 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             return 1;
         }
         if (s_rows[s_focus].kind == UI_KIND_ALBUM) {
-            s_ctx_album = s_rows[s_focus].id;
-            push_view(UI_VIEW_ALBUM_TRACKS);
-            ui_refresh_lists(app);
+            s_hold_kind = UI_KIND_ALBUM;
+            s_hold_did = 0;
             return 1;
         }
         if (s_rows[s_focus].kind == UI_KIND_ARTIST) {
-            s_ctx_artist = s_rows[s_focus].id;
-            push_view(UI_VIEW_ARTIST_ALBUMS);
-            ui_refresh_lists(app);
+            s_hold_kind = UI_KIND_ARTIST;
+            s_hold_did = 0;
             return 1;
         }
         if (s_rows[s_focus].kind == UI_KIND_FOLDER) {
@@ -2610,9 +3545,8 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             return 1;
         }
         if (s_rows[s_focus].kind == UI_KIND_PLAYLIST && s_rows[s_focus].id > 0) {
-            s_ctx_playlist = s_rows[s_focus].id;
-            push_view(UI_VIEW_PLAYLIST_TRACKS);
-            ui_refresh_lists(app);
+            s_hold_kind = UI_KIND_PLAYLIST;
+            s_hold_did = 0;
             return 1;
         }
         if (s_rows[s_focus].kind == UI_KIND_TRACK) {
@@ -2625,14 +3559,34 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             s_np_opt = NP_OPT_PRESET;
             return 1;
         }
-        if (s_view == UI_VIEW_QUEUE && s_rows[s_focus].id == 100) {
-            app->shuffle = !app->shuffle;
+        if (s_view == UI_VIEW_QUEUE && s_rows[s_focus].kind == UI_KIND_ACTION &&
+            s_rows[s_focus].id == 1) {
+            push_view(UI_VIEW_QUEUE_OPTIONS);
             ui_refresh_lists(app);
             return 1;
         }
-        if (s_view == UI_VIEW_QUEUE && s_rows[s_focus].id == 101) {
-            app->repeat = (VibeRepeat)(((int)app->repeat + 1) % 3);
-            ui_refresh_lists(app);
+        if (s_view == UI_VIEW_QUEUE_OPTIONS) {
+            int id = (int)s_rows[s_focus].id;
+            if (id == 1) {
+                library_queue_clear();
+                app_halt(app);
+                snprintf(app->status, sizeof(app->status), "Queue cleared");
+                pop_view();
+                ui_refresh_lists(app);
+            } else if (id == 2) {
+                s_pl_name[0] = '\0';
+                push_view(UI_VIEW_QUEUE_SAVE);
+                kb_reset();
+                ui_refresh_lists(app);
+            }
+            return 1;
+        }
+        if (s_view == UI_VIEW_QUEUE_SAVE) {
+            if (save_queue_playlist(app) == 0) {
+                pop_view();
+                pop_view();
+                ui_refresh_lists(app);
+            }
             return 1;
         }
         if (s_view == UI_VIEW_BINDING) {
@@ -2710,36 +3664,61 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             s_rate_flash_good = 0;
             s_rate_flash_ms = SDL_GetTicks();
             viz_next_preset(0);
-            return 1;
-        }
-        if (s_focus >= 0 && s_focus < s_nrows) {
-            if (s_rows[s_focus].kind == UI_KIND_TRACK) {
-                library_queue_add(s_rows[s_focus].id);
-            } else if (s_rows[s_focus].kind == UI_KIND_ALBUM) {
-                library_queue_add_album(s_rows[s_focus].id);
-            } else if (s_rows[s_focus].kind == UI_KIND_ARTIST) {
-                library_queue_add_artist(s_rows[s_focus].id);
-            } else if (s_rows[s_focus].kind == UI_KIND_FOLDER) {
-                library_queue_add_folder(s_rows[s_focus].id);
-            }
-            snprintf(app->status, sizeof(app->status), "Added to queue");
         }
         return 1;
+    case VIBE_CMD_QUEUE_ADD_HOLD:
+        if (kb_on() && s_kb_active) {
+            return 1;
+        }
+        if (s_view == UI_VIEW_NOW_PLAYING) {
+            if (app->now_valid && !app->playing_radio && app->now.id > 0) {
+                queue_remove_track_id(app, app->now.id);
+            }
+            return 1;
+        }
+        if (s_view == UI_VIEW_QUEUE) {
+            int qi = queue_focus_index();
+            if (qi >= 0) {
+                queue_remove_index(app, qi);
+            }
+            return 1;
+        }
+        if (s_focus >= 0 && s_focus < s_nrows && s_rows[s_focus].kind == UI_KIND_TRACK) {
+            queue_remove_track_id(app, s_rows[s_focus].id);
+        }
+        return 1;
+    case VIBE_CMD_QUEUE_APPEND:
+        if (kb_on() && s_kb_active) {
+            return 1;
+        }
+        if (s_view == UI_VIEW_NOW_PLAYING) {
+            if (app->now_valid && !app->playing_radio && app->now.id > 0) {
+                if (library_queue_add(app->now.id) == 0) {
+                    snprintf(app->status, sizeof(app->status), "Added to queue");
+                } else {
+                    snprintf(app->status, sizeof(app->status),
+                             library_queue_len() >= VIBE_QUEUE_MAX ? "Queue is full" : "Nothing to add");
+                }
+            }
+            return 1;
+        }
+        queue_append_focus(app);
+        return 1;
     case VIBE_CMD_SEARCH_BACKSPACE:
-        if (kb_on()) {
-            char *buf = kb_buf();
-            size_t n = strlen(buf);
-            if (n > 0) {
-                buf[n - 1] = '\0';
+        if (kb_on() && s_kb_active) {
+            kb_backspace();
+            if (s_view == UI_VIEW_SEARCH) {
                 ui_refresh_lists(app);
             }
             return 1;
         }
         return 1;
     case VIBE_CMD_SEARCH_CLEAR:
-        if (kb_on()) {
-            kb_buf()[0] = '\0';
-            ui_refresh_lists(app);
+        if (kb_on() && s_kb_active) {
+            kb_clear();
+            if (s_view == UI_VIEW_SEARCH) {
+                ui_refresh_lists(app);
+            }
         }
         return 1;
     case VIBE_CMD_SEARCH_OR_REMOVE:
@@ -2762,15 +3741,6 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         if (s_view == UI_VIEW_DIR_BROWSER) {
             return 1;
         }
-        if (s_view == UI_VIEW_QUEUE) {
-            int qoff = 2;
-            int qi = s_focus - qoff;
-            if (qi >= 0) {
-                library_queue_remove(qi);
-                ui_refresh_lists(app);
-            }
-            return 1;
-        }
         if (s_view == UI_VIEW_RADIO_CUSTOM && s_rows[s_focus].kind == UI_KIND_RADIO) {
             library_radio_custom_remove(s_rows[s_focus].id);
             ui_refresh_lists(app);
@@ -2781,20 +3751,28 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             ui_refresh_lists(app);
             return 1;
         }
-        if (kb_on()) {
-            char *buf = kb_buf();
-            size_t n = strlen(buf);
-            if (n > 0) {
-                buf[n - 1] = '\0';
+        if (s_view == UI_VIEW_ARTIST_FAVORITES && s_rows[s_focus].kind == UI_KIND_ARTIST) {
+            library_artist_fav_remove(s_rows[s_focus].id);
+            ui_refresh_lists(app);
+            return 1;
+        }
+        if (s_view == UI_VIEW_ALBUM_FAVORITES && s_rows[s_focus].kind == UI_KIND_ALBUM) {
+            library_album_fav_remove(s_rows[s_focus].id);
+            ui_refresh_lists(app);
+            return 1;
+        }
+        if (s_view == UI_VIEW_PLAYLIST_FAVORITES && s_rows[s_focus].kind == UI_KIND_PLAYLIST) {
+            library_playlist_fav_remove(s_rows[s_focus].id);
+            ui_refresh_lists(app);
+            return 1;
+        }
+        if (kb_on() && s_kb_active) {
+            kb_backspace();
+            if (s_view == UI_VIEW_SEARCH) {
                 ui_refresh_lists(app);
             }
             return 1;
         }
-        push_view(UI_VIEW_SEARCH);
-        s_show_kb = 1;
-        s_kb_active = 1;
-        s_kb_i = 0;
-        ui_refresh_lists(app);
         return 1;
     default:
         return 0;
@@ -2803,19 +3781,12 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
 
 void ui_text_input(const char *text)
 {
-    char *buf;
-    size_t n, m, cap;
     if (!text || !kb_on()) {
         return;
     }
-    buf = kb_buf();
-    cap = kb_cap();
-    n = strlen(buf);
-    m = strlen(text);
-    if (n + m >= cap) {
-        return;
-    }
-    memcpy(buf + n, text, m + 1);
+    s_kb_active = 1;
+    s_kb_zone = KB_ZONE_FIELD;
+    kb_insert(text);
 }
 
 void ui_draw(struct App *app)
@@ -2841,6 +3812,9 @@ void ui_draw(struct App *app)
         } else {
             draw_list(app);
         }
+    }
+    if (s_quit_prompt) {
+        draw_quit_prompt();
     }
     if (s_rate_flash_ms) {
         uint32_t now = SDL_GetTicks();

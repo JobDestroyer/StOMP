@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 /*
  * Single-file launcher. The packed stomp is: this stub + payload + trailer.
  * Payload is extracted once to $XDG_CACHE_HOME/vibe/r/<crc>/ then exec'd.
@@ -12,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -311,24 +316,57 @@ static int ready(const char *dir, uint32_t crc)
 
 static int is_runtime_name(const char *name)
 {
-    size_t i, n;
+    size_t i;
     if (!name || !name[0]) {
         return 0;
     }
-    n = strlen(name);
-    if (n >= 5 && strcmp(name + n - 5, ".part") == 0) {
-        n -= 5;
-    }
-    if (n != 8) {
-        return 0;
-    }
-    for (i = 0; i < n; i++) {
+    for (i = 0; i < 8; i++) {
         char c = name[i];
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
             return 0;
         }
     }
-    return 1;
+    if (name[8] == '\0') {
+        return 1;
+    }
+    if (strncmp(name + 8, ".part", 5) == 0 && (name[13] == '\0' || name[13] == '.')) {
+        return 1;
+    }
+    return 0;
+}
+
+static int runtime_in_use(const char *dir)
+{
+    DIR *pd;
+    struct dirent *de;
+    size_t n;
+    if (!dir || !dir[0]) {
+        return 0;
+    }
+    n = strlen(dir);
+    pd = opendir("/proc");
+    if (!pd) {
+        return 1;
+    }
+    while ((de = readdir(pd)) != NULL) {
+        char link[64], dest[2048];
+        ssize_t m;
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') {
+            continue;
+        }
+        snprintf(link, sizeof(link), "/proc/%s/exe", de->d_name);
+        m = readlink(link, dest, sizeof(dest) - 1);
+        if (m < 0) {
+            continue;
+        }
+        dest[m] = '\0';
+        if ((size_t)m >= n && strncmp(dest, dir, n) == 0 && dest[n] == '/') {
+            closedir(pd);
+            return 1;
+        }
+    }
+    closedir(pd);
+    return 0;
 }
 
 static void gc_old_runtimes(const char *keep_dir)
@@ -366,6 +404,9 @@ static void gc_old_runtimes(const char *keep_dir)
             continue;
         }
         snprintf(child, sizeof(child), "%s/%s", parent, de->d_name);
+        if (runtime_in_use(child)) {
+            continue;
+        }
         fprintf(stderr, "StOMP: removing old runtime %s\n", child);
         rm_tree(child);
     }
@@ -431,27 +472,53 @@ int main(int argc, char **argv)
     cache_root(dir, sizeof(dir), crc);
 
     if (!ready(dir, crc)) {
+        char lockp[1100];
+        int lk;
         fprintf(stderr, "StOMP: unpacking runtime to %s\n", dir);
-        snprintf(tmp, sizeof(tmp), "%s.part", dir);
-        rm_tree(tmp);
-        rm_tree(dir);
-        if (mkdir_p(tmp) != 0) {
-            fprintf(stderr, "StOMP: mkdir %s: %s\n", tmp, strerror(errno));
-            fclose(in);
-            return 1;
+        snprintf(lockp, sizeof(lockp), "%s.lock", dir);
+        lk = open(lockp, O_CREAT | O_RDWR, 0644);
+        if (lk >= 0) {
+            flock(lk, LOCK_EX);
         }
-        if (extract(in, payload_off, nfiles, tmp, &got_crc) != 0 || got_crc != crc) {
-            fprintf(stderr, "StOMP: extract failed%s\n",
-                    got_crc != crc && got_crc != 0 ? " (crc mismatch)" : "");
+        if (ready(dir, crc)) {
+            if (lk >= 0) {
+                close(lk);
+            }
+        } else {
+            snprintf(tmp, sizeof(tmp), "%s.part.%ld", dir, (long)getpid());
             rm_tree(tmp);
-            fclose(in);
-            return 1;
-        }
-        if (write_stamp(tmp, crc) != 0 || rename(tmp, dir) != 0) {
-            fprintf(stderr, "StOMP: finalize runtime: %s\n", strerror(errno));
-            rm_tree(tmp);
-            fclose(in);
-            return 1;
+            if (mkdir_p(tmp) != 0) {
+                fprintf(stderr, "StOMP: mkdir %s: %s\n", tmp, strerror(errno));
+                if (lk >= 0) {
+                    close(lk);
+                }
+                fclose(in);
+                return 1;
+            }
+            if (extract(in, payload_off, nfiles, tmp, &got_crc) != 0 || got_crc != crc) {
+                fprintf(stderr, "StOMP: extract failed%s\n",
+                        got_crc != crc && got_crc != 0 ? " (crc mismatch)" : "");
+                rm_tree(tmp);
+                if (lk >= 0) {
+                    close(lk);
+                }
+                fclose(in);
+                return 1;
+            }
+            if (write_stamp(tmp, crc) != 0 || rename(tmp, dir) != 0) {
+                rm_tree(tmp);
+                if (!ready(dir, crc)) {
+                    fprintf(stderr, "StOMP: finalize runtime: %s\n", strerror(errno));
+                    if (lk >= 0) {
+                        close(lk);
+                    }
+                    fclose(in);
+                    return 1;
+                }
+            }
+            if (lk >= 0) {
+                close(lk);
+            }
         }
     }
     fclose(in);

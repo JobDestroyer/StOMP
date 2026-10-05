@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #include "audio.h"
 
 #include <SDL.h>
@@ -151,6 +155,20 @@ void audio_pause(int paused)
 int audio_paused(void)
 {
     return atomic_load(&s_paused) != 0;
+}
+
+void audio_lock(void)
+{
+    if (s_dev) {
+        SDL_LockAudioDevice(s_dev);
+    }
+}
+
+void audio_unlock(void)
+{
+    if (s_dev) {
+        SDL_UnlockAudioDevice(s_dev);
+    }
 }
 
 void audio_list_devices(char names[][128], int *count, int cap)

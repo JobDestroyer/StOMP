@@ -1,4 +1,4 @@
-# Build and packer output (repo-root only)
+# Build and packer output
 /build/
 /out/
 /stomp
@@ -7,17 +7,16 @@
 /vibe-stub
 /packembed
 
-# Compiled objects and static libs. Keep the vendored SQLite archive.
+# Compiled objects and libraries (SQLite is built from sqlite3.c)
 *.o
 *.a
-!third_party/libsqlite3.a
 *.so
 *.so.*
 *.dylib
 *.dll
 *.exe
 
-# CMake / Ninja (if someone configures in-tree)
+# CMake / Ninja (in-tree configure)
 CMakeCache.txt
 CMakeFiles/
 CMakeUserPresets.json
@@ -31,6 +30,10 @@ build.ninja
 .ninja_deps
 .ninja_log
 
+# Packed binaries that are not source (keep Releases/README.md)
+/Releases/*
+!/Releases/README.md
+
 # Runtime data that belongs in ~/.config and ~/.local/share
 *.db
 *.db-wal
@@ -43,7 +46,6 @@ build.ninja
 *.swp
 *.swo
 *.kate-swp
-.README.md.kate-swp
 AGENTS.md
 .DS_Store
 Thumbs.db
@@ -52,3 +54,7 @@ Thumbs.db
 *.user
 .clangd/
 .cache/clangd/
+
+# Local version folders; published tree is the repo root
+/0.1/
+/0.2/

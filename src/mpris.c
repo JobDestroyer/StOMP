@@ -1,3 +1,7 @@
+/* SPDX-License-Identifier: LGPL-2.1-only
+ * Copyright (C) 2026 JobDestroyer
+ */
+
 #include "mpris.h"
 
 #include "app.h"
@@ -100,10 +104,54 @@ static int64_t len_us(void)
     return (int64_t)(d * 1000000.0);
 }
 
+static unsigned path_hash(const char *s)
+{
+    unsigned h = 2166136261u;
+    if (!s) {
+        return 0;
+    }
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 16777619u;
+    }
+    return h;
+}
+
 static void track_path(char *buf, size_t n)
 {
     long long id = s_app && s_app->now_valid ? (long long)s_app->now.id : 0;
-    snprintf(buf, n, "/org/mpris/MediaPlayer2/track/%lld", id);
+    if (id > 0) {
+        snprintf(buf, n, "/org/mpris/MediaPlayer2/track/%lld", id);
+        return;
+    }
+    snprintf(buf, n, "/org/mpris/MediaPlayer2/track/r%u",
+             path_hash(s_app && s_app->now_valid ? s_app->now.path : ""));
+}
+
+static void file_url(char *out, size_t n, const char *path)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    const char *p;
+    if (!out || n == 0) {
+        return;
+    }
+    if (o + 8 < n) {
+        memcpy(out, "file://", 7);
+        o = 7;
+    }
+    for (p = path ? path : ""; *p && o + 4 < n; p++) {
+        unsigned char c = (unsigned char)*p;
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '/' || c == '-' || c == '_' || c == '.' || c == '~') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 15];
+        }
+    }
+    out[o] = '\0';
 }
 
 static void append_basic_variant(DBusMessageIter *parent, int type, const void *val)
@@ -143,7 +191,8 @@ static void append_metadata(DBusMessageIter *parent)
 {
     DBusMessageIter var, arr;
     char path[128];
-    char url[VIBE_PATH_MAX + 8];
+    char url[VIBE_PATH_MAX * 3 + 16];
+    char icy[VIBE_NAME_MAX];
     dbus_bool_t ok;
     int64_t length;
     const char *title = "";
@@ -171,13 +220,31 @@ static void append_metadata(DBusMessageIter *parent)
     }
     length = len_us();
     dict_put_sv(&arr, lkey, DBUS_TYPE_INT64, &length);
+    icy[0] = '\0';
     if (s_app && s_app->now_valid) {
         title = s_app->now.title[0] ? s_app->now.title : "Unknown";
         artist = s_app->now.artist;
         album = s_app->now.album;
+        if (s_app->playing_radio || decode_is_live()) {
+            decode_icy(icy, (int)sizeof(icy));
+            if (icy[0]) {
+                title = icy;
+            }
+        }
         if (s_app->now.path[0] == '/') {
             const char *urlp;
-            snprintf(url, sizeof(url), "file://%s", s_app->now.path);
+            file_url(url, sizeof(url), s_app->now.path);
+            urlp = url;
+            dict_put_sv(&arr, urlk, DBUS_TYPE_STRING, &urlp);
+        } else if (strncmp(s_app->now.path, "http://", 7) == 0 ||
+                   strncmp(s_app->now.path, "https://", 8) == 0) {
+            const char *urlp;
+            snprintf(url, sizeof(url), "%s", s_app->now.path);
+            urlp = url;
+            dict_put_sv(&arr, urlk, DBUS_TYPE_STRING, &urlp);
+        } else if (s_app->radio_url[0]) {
+            const char *urlp;
+            snprintf(url, sizeof(url), "%s", s_app->radio_url);
             urlp = url;
             dict_put_sv(&arr, urlk, DBUS_TYPE_STRING, &urlp);
         }
@@ -202,7 +269,7 @@ static void fill_root_all(DBusMessageIter *array)
     dict_put_as(array, "SupportedMimeTypes", "audio/mpeg");
 }
 
-static void fill_player_all(DBusMessageIter *array)
+static void fill_player_all(DBusMessageIter *array, int include_pos)
 {
     const char *status = playback_status();
     const char *loop;
@@ -234,7 +301,9 @@ static void fill_player_all(DBusMessageIter *array)
     }
     dbus_message_iter_close_container(array, &dict);
     dict_put_sv(array, "Volume", DBUS_TYPE_DOUBLE, &vol);
-    dict_put_sv(array, "Position", DBUS_TYPE_INT64, &pos);
+    if (include_pos) {
+        dict_put_sv(array, "Position", DBUS_TYPE_INT64, &pos);
+    }
     dict_put_sv(array, "MinimumRate", DBUS_TYPE_DOUBLE, &minr);
     dict_put_sv(array, "MaximumRate", DBUS_TYPE_DOUBLE, &maxr);
     dict_put_sv(array, "CanGoNext", DBUS_TYPE_BOOLEAN, &can);
@@ -385,15 +454,24 @@ static void handle_player_method(const char *member, DBusMessage *msg)
         }
     } else if (strcmp(member, "SetPosition") == 0) {
         DBusMessageIter in;
+        const char *tid = NULL;
         int64_t pos = 0;
+        char cur[128];
         dbus_message_iter_init(msg, &in);
+        if (dbus_message_iter_get_arg_type(&in) == DBUS_TYPE_OBJECT_PATH) {
+            dbus_message_iter_get_basic(&in, &tid);
+        }
         dbus_message_iter_next(&in);
+        track_path(cur, sizeof(cur));
+        if (!tid || strcmp(tid, cur) != 0) {
+            return;
+        }
         if (dbus_message_iter_get_arg_type(&in) == DBUS_TYPE_INT64) {
             dbus_message_iter_get_basic(&in, &pos);
             if (pos < 0) {
                 pos = 0;
             }
-            decode_seek((double)pos / 1000000.0);
+            app_seek_delta(s_app, (double)pos / 1000000.0 - decode_position());
         }
     }
 }
@@ -445,7 +523,7 @@ static DBusHandlerResult filter(DBusConnection *c, DBusMessage *msg, void *data)
         if (want && strcmp(want, IFACE_ROOT) == 0) {
             fill_root_all(&arr);
         } else {
-            fill_player_all(&arr);
+            fill_player_all(&arr, 1);
         }
         dbus_message_iter_close_container(&out, &arr);
         dbus_connection_send(c, reply, NULL);
@@ -511,6 +589,7 @@ int mpris_init(App *app)
     if (ret != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
         fprintf(stderr, "StOMP: MPRIS name busy (%s)\n", err.message ? err.message : "");
         dbus_error_free(&err);
+        dbus_connection_unref(s_bus);
         s_bus = NULL;
         return -1;
     }
@@ -553,10 +632,30 @@ void mpris_notify(void)
     dbus_message_iter_init_append(sig, &args);
     dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &iface);
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &changed);
-    fill_player_all(&changed);
+    fill_player_all(&changed, 0);
     dbus_message_iter_close_container(&args, &changed);
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "s", &inv);
     dbus_message_iter_close_container(&args, &inv);
+    dbus_connection_send(s_bus, sig, NULL);
+    dbus_connection_flush(s_bus);
+    dbus_message_unref(sig);
+}
+
+void mpris_notify_seeked(void)
+{
+    DBusMessage *sig;
+    DBusMessageIter args;
+    int64_t p;
+    if (!s_bus) {
+        return;
+    }
+    sig = dbus_message_new_signal(MPRIS_PATH, IFACE_PLAYER, "Seeked");
+    if (!sig) {
+        return;
+    }
+    p = pos_us();
+    dbus_message_iter_init_append(sig, &args);
+    dbus_message_iter_append_basic(&args, DBUS_TYPE_INT64, &p);
     dbus_connection_send(s_bus, sig, NULL);
     dbus_connection_flush(s_bus);
     dbus_message_unref(sig);
