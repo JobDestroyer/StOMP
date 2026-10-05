@@ -86,3 +86,7 @@ Other bundled material keeps its own terms:
 SDL2, FFmpeg, FreeType, and OpenGL come from the system and keep their own
 licenses. A typical distro FFmpeg is also LGPL; do not enable extra GPL codecs
 in a custom FFmpeg build unless you want the whole combination under GPL.
+
+StOMP is not an official Valve product. It is not affiliated with, endorsed by,
+or sponsored by Valve Corporation. Steam, SteamOS, Steam Deck, and Steam Machine
+are trademarks of Valve Corporation.
