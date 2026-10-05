@@ -21,100 +21,11 @@ Features:
 
 ## Install
 
-On a Steam Machine or SteamOS desktop session (one line):
+In Desktop Mode open your Konsole and paste this: 
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JobDestroyer/StOMP/main/install.sh | bash
 ```
-
-That copies StOMP to `~/.local/share/stomp/stomp`, adds a Steam library shortcut, and installs Big Picture / library art. Restart Steam (or return to Gaming Mode) once.
-
-From a built source tree, with Steam closed or in Desktop Mode:
-
-```bash
-./install.sh
-```
-
-The installer uses `./build/stomp` if present, otherwise the latest GitHub Release. Override with `STOMP_BIN=/path/to/stomp ./install.sh`.
-
-Manual: download `stomp` from [GitHub Releases](https://github.com/JobDestroyer/StOMP/releases), `chmod +x`, run it, or add it in Steam Desktop Mode.
-
-
-
-## Build dependencies
-
-The player is an x86_64 Linux binary aimed at **SteamOS / Steam Machine / Big
-Picture**. Build on any glibc Linux with:
-
-- GCC (C11/C17) and a C++14 compiler (C++ is only used to compile **libprojectM**)
-- CMake ≥ 3.21, Ninja or Make, pkg-config
-- SDL2
-- FFmpeg 5+ (`libavformat`, `libavcodec`, `libswresample`, `libavutil`)
-- FreeType 2
-- OpenGL 3.3 core
-- dbus-1 (MPRIS, used by MusicControlol)
-
-SQLite 3.46.1 is vendored as the official amalgamation (`third_party/sqlite3.c`,
-`sqlite3.h`, `sqlite3ext.h`) and compiled into the player. Distro sqlite `-dev`
-packages are not required.
-
-libprojectM 4.1.2 is built from a **pruned** `third_party/projectm` tree as a
-**shared** library and linked dynamically (LGPL-2.1). Do not static-link it.
-Upstream docs, screenshots, tests, and git history are not in this tree.
-
-SteamOS / Arch (workstation or SDK):
-
-```bash
-sudo pacman -S --needed base-devel cmake ninja pkgconf sdl2 ffmpeg freetype2 mesa dbus
-```
-
-Debian/Ubuntu workstation (to cross-build the same binary):
-
-```bash
-sudo apt install build-essential cmake ninja-build pkg-config \
-    libsdl2-dev libavformat-dev libavcodec-dev libswresample-dev \
-    libavutil-dev libfreetype-dev libgl-dev libdbus-1-dev
-```
-
-## CMake
-
-From this source directory (the one that contains `CMakeLists.txt`):
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G Ninja
-cmake --build build --target stomp-pack
-```
-
-`build/stomp` is a **single file** (the packed StOMP executable). libprojectM,
-presets, textures, and the HUD font are packed into that ELF (libprojectM stays
-a shared library inside the payload, which is what LGPL requires). On first
-launch it unpacks into `~/.cache/vibe/r/<id>/` and execs the real player from
-there.
-
-```bash
-./build/stomp --windowed --music-dir "$HOME/Music"
-./build/stomp /path/to/song.flac
-```
-
-Copy that one packed file onto a Steam Machine and run it. You can still
-inspect the unpacked layout at `build/vibe-core` plus the `.so` files if you
-are debugging.
-
-Point the library at folders from **Library → Settings → Music folder**.
-That list is saved in `~/.config/vibe/vibe.conf` and used on the next launch.
-`--music-dir` still adds a root for the current run. Until you set a folder
-in-app, StOMP also looks at `~/Music`, `/run/media/*` (microSD), `/media/*`,
-and a `demo/` directory next to the source tree if one is present.
-
-Music library and session: `~/.local/share/vibe/library.db`.
-Visualization likes/dislikes: `~/.local/share/vibe/viz.db` (survives deleting `library.db`).
-To copy ratings out of an old combined library: `tools/split-viz-ratings`.
-
-**Library → Playlists** lists `.m3u`, `.m3u8`, `.pls`, `.pl`, `.xspf`, `.wpl`,
-`.zpl`, `.asx`, `.wax`, `.wmx`, and `.cue` files under those folders. Each
-entry is matched first by the stored path, then by filename anywhere in the
-library, then by title (and artist when the playlist has one). HTTP streams
-in a playlist file are skipped. Hold Y adds a playlist to the queue.
 
 ## Controls
 
@@ -153,15 +64,6 @@ the list you added it from. Search is Library → Search. Queue → Queue Option
 clear the queue or save it as an `.m3u` in your music folder.
 B on Library goes back to now playing. On now playing, B hides the HUD; B
 again asks whether to quit. Tab and Esc both open and close the Library.
-
-No mouse is required. The SDL Game Controller API is required.
-
-## Formats
-
-FLAC, MP3, Ogg Vorbis, Opus, WAV, AAC/M4A. Output is stereo float 44.1 kHz.
-FFmpeg resamples only when needed. The same decoded PCM is written to the
-device and fed to ProjectM (target audio-to-visual latency under ~35 ms).
-There is no PipeWire/Pulse loopback and no microphone path.
 
 ## License
 
