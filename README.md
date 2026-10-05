@@ -19,13 +19,6 @@ Features:
 
 ![StOMP interface 2](assets/StOMP_Interface2.jpg)
 
-## Install
-
-In Desktop Mode open your Konsole and paste this: 
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/JobDestroyer/StOMP/main/install.sh | bash
-```
 
 ## Controls
 
