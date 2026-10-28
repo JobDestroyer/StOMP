@@ -15,6 +15,9 @@ Features:
  
 ## Screenshots
 
+<img width="1280" height="719" alt="image" src="https://github.com/user-attachments/assets/ed7cdec2-1d8b-42bf-b570-b456104e5e37" />
+
+
 ![StOMP interface](assets/StOMP_Interface.jpg)
 
 ![StOMP interface 2](assets/StOMP_Interface2.jpg)
