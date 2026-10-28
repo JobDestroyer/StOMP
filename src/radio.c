@@ -57,6 +57,7 @@ static int http_get(const char *url, char **out)
     av_dict_set(&opts, "timeout", "15000000", 0);
     av_dict_set(&opts, "rw_timeout", "15000000", 0);
     av_dict_set(&opts, "reconnect", "1", 0);
+    av_dict_set(&opts, "protocol_whitelist", "http,https,tcp,tls", 0);
     err = avio_open2(&io, url, AVIO_FLAG_READ, NULL, &opts);
     av_dict_free(&opts);
     if (err < 0) {
@@ -68,10 +69,10 @@ static int http_get(const char *url, char **out)
         return -1;
     }
     for (;;) {
-        if (cap - n < 8192) {
+        if (n >= cap - 1) {
             char *nb;
             int ncap = cap * 2;
-            if (ncap > 4 * 1024 * 1024) {
+            if (ncap > 4 * 1024 * 1024 || ncap <= cap) {
                 free(buf);
                 avio_closep(&io);
                 return -1;
@@ -474,7 +475,7 @@ static int pick_soma_playlist(const char *ch, const char *ch_end, char *url, int
         js_obj_str(obj, obj_end, "quality", qual, (int)sizeof(qual));
         js_obj_str(obj, obj_end, "url", u, (int)sizeof(u));
         sc = pls_score(fmt, qual, u);
-        if (u[0] && sc > best) {
+        if (u[0] && radio_url_is_http(u) && sc > best) {
             best = sc;
             snprintf(best_url, sizeof(best_url), "%s", u);
         }
@@ -490,6 +491,11 @@ static int pick_soma_playlist(const char *ch, const char *ch_end, char *url, int
     return 0;
 }
 
+int radio_url_is_http(const char *u)
+{
+    return u && (strncasecmp(u, "http://", 7) == 0 || strncasecmp(u, "https://", 8) == 0);
+}
+
 int radio_resolve_play_url(const char *in, char *out, int n)
 {
     char *body = NULL;
@@ -500,6 +506,9 @@ int radio_resolve_play_url(const char *in, char *out, int n)
         return -1;
     }
     out[0] = '\0';
+    if (!radio_url_is_http(in)) {
+        return -1;
+    }
     p = strrchr(in, '.');
     if (p && strcasecmp(p, ".pls") == 0) {
         is_pls = 1;
@@ -512,33 +521,8 @@ int radio_resolve_play_url(const char *in, char *out, int n)
         return 0;
     }
     if (http_get(in, &body) < 0 || !body) {
-        /* local file */
-        FILE *fp = fopen(in, "rb");
-        long sz;
-        if (!fp) {
-            snprintf(out, n, "%s", in);
-            return 0;
-        }
-        fseek(fp, 0, SEEK_END);
-        sz = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        if (sz < 0 || sz > 1024 * 1024) {
-            fclose(fp);
-            snprintf(out, n, "%s", in);
-            return 0;
-        }
-        body = (char *)malloc((size_t)sz + 1);
-        if (!body) {
-            fclose(fp);
-            return -1;
-        }
-        if (fread(body, 1, (size_t)sz, fp) != (size_t)sz) {
-            fclose(fp);
-            free(body);
-            return -1;
-        }
-        body[sz] = '\0';
-        fclose(fp);
+        snprintf(out, n, "%s", in);
+        return 0;
     }
     {
         char *line = body;
@@ -557,16 +541,18 @@ int radio_resolve_play_url(const char *in, char *out, int n)
             }
             if (is_pls && strncasecmp(line, "File", 4) == 0) {
                 char *eq = strchr(line, '=');
-                if (eq && eq[1]) {
+                if (eq && eq[1] && radio_url_is_http(eq + 1)) {
                     snprintf(out, n, "%s", eq + 1);
                     free(body);
                     return 0;
                 }
             }
             if (is_m3u && line[0] && line[0] != '#') {
-                snprintf(out, n, "%s", line);
-                free(body);
-                return 0;
+                if (radio_url_is_http(line)) {
+                    snprintf(out, n, "%s", line);
+                    free(body);
+                    return 0;
+                }
             }
             line = nl ? nl + 1 : NULL;
         }
@@ -583,9 +569,9 @@ void radio_name_from_url(const char *url, char *out, int n)
         return;
     }
     s = url;
-    if (strncmp(s, "http://", 7) == 0) {
+    if (strncasecmp(s, "http://", 7) == 0) {
         s += 7;
-    } else if (strncmp(s, "https://", 8) == 0) {
+    } else if (strncasecmp(s, "https://", 8) == 0) {
         s += 8;
     }
     slash = strrchr(s, '/');
@@ -654,7 +640,7 @@ int radio_fetch_soma(char *err, int errn)
         if (pick_soma_playlist(obj, obj_end, pls, (int)sizeof(pls)) == 0) {
             snprintf(it->url, sizeof(it->url), "%s", pls);
         }
-        if (it->name[0] && it->url[0]) {
+        if (it->name[0] && it->url[0] && radio_url_is_http(it->url)) {
             s_nsoma++;
         }
         s = js_skip_ws(obj_end);
@@ -793,16 +779,28 @@ int radio_fetch_stations(const char *country_code, char *err, int errn)
 {
     char *body = NULL;
     const char *s;
-    int hi, n = 0;
+    char cc[8];
+    int hi, n = 0, ci, co;
     s_nst = 0;
     if (!country_code || !country_code[0]) {
+        return -1;
+    }
+    co = 0;
+    for (ci = 0; country_code[ci] && co < (int)sizeof(cc) - 1; ci++) {
+        unsigned char c = (unsigned char)country_code[ci];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            cc[co++] = (char)c;
+        }
+    }
+    cc[co] = '\0';
+    if (!cc[0]) {
         return -1;
     }
     for (hi = 0; hi < (int)(sizeof(k_rb_hosts) / sizeof(k_rb_hosts[0])); hi++) {
         char url[512];
         snprintf(url, sizeof(url),
                  "%s/json/stations/search?countrycode=%s&hidebroken=true&order=clickcount&reverse=true&limit=%d",
-                 k_rb_hosts[hi], country_code, RADIO_STATION_MAX);
+                 k_rb_hosts[hi], cc, RADIO_STATION_MAX);
         if (http_get(url, &body) >= 0 && body) {
             break;
         }
@@ -851,7 +849,7 @@ int radio_fetch_stations(const char *country_code, char *err, int errn)
         } else {
             snprintf(it->sub, sizeof(it->sub), "%s plays", clicks[0] ? clicks : "0");
         }
-        if (it->name[0] && it->url[0]) {
+        if (it->name[0] && it->url[0] && radio_url_is_http(it->url)) {
             n++;
         }
         s = js_skip_ws(obj_end);

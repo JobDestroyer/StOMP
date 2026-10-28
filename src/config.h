@@ -15,9 +15,20 @@
 #define VIBE_RING_FRAMES 65536
 #define VIBE_VIZ_FRAMES 1024
 #define VIBE_DECODE_SCRATCH_FRAMES 8192
-#define VIBE_QUEUE_MAX 1024
+#define VIBE_QUEUE_MAX 16384 /* leftover default; the play queue grows with malloc */
 #define VIBE_LIST_MAX 4096
 #define VIBE_UI_ROWS_MAX 16384
+
+/*
+ * 1 = same album title from different artists can be separate rows.
+ *     Compilations (many artists, or one folder) stay one album.
+ *     Split only when two+ artists each have a real set of tracks,
+ *     in different folders or with album-artist tags.
+ * 0 = old UNIQUE(name). Flip this, rebuild, and launch to undo.
+ */
+#ifndef VIBE_ALBUMS_PER_ARTIST
+#define VIBE_ALBUMS_PER_ARTIST 1
+#endif
 
 typedef enum {
     VIBE_PROFILE_AUTO = 0,
@@ -58,9 +69,15 @@ typedef struct {
     char music_dirs[VIBE_MAX_MUSIC_DIRS][VIBE_PATH_MAX];
     int music_dir_count;
     int music_user; /* 1 = folders set in-app; skip auto-discovered roots */
+    char karaoke_dirs[VIBE_MAX_MUSIC_DIRS][VIBE_PATH_MAX];
+    int karaoke_dir_count;
+    int karaoke_mode; /* 1 = Karaoke Mode library */
+    char karaoke_db_path[VIBE_PATH_MAX];
     float volume;
     int profile_mode;
     int start_library;
+    int np_keep_info; /* 1 = now-playing overlay never idles off */
+    int vsync; /* 1 = wait for vblank (no tearing) */
     int viz_shuffle;
     char audio_device[128];
     char config_dir[VIBE_PATH_MAX];
@@ -74,8 +91,10 @@ typedef struct {
 
 int config_init(VibeConfig *cfg, int argc, char **argv);
 void config_save(const VibeConfig *cfg);
-int config_add_music_dir(VibeConfig *cfg, const char *path); /* 1 added, 0 duplicate, -1 full/invalid */
+int config_add_music_dir(VibeConfig *cfg, const char *path); /* 1 added, 0 duplicate, -1 full/invalid, -2 overlaps karaoke */
 void config_remove_music_dir(VibeConfig *cfg, int index);
+int config_add_karaoke_dir(VibeConfig *cfg, const char *path); /* 1 added, 0 duplicate, -1 full/invalid, -2 overlaps music */
+void config_remove_karaoke_dir(VibeConfig *cfg, int index);
 void config_profile_params(int effective_profile, VibeProfileParams *out);
 int config_resolve_effective_profile(int mode, int on_battery, int display_h);
 void config_strlcpy(char *dst, size_t dst_sz, const char *src);

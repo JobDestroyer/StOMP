@@ -15,6 +15,7 @@ typedef struct {
     char title[VIBE_NAME_MAX];
     char artist[VIBE_NAME_MAX];
     char album[VIBE_NAME_MAX];
+    char album_artist[VIBE_NAME_MAX];
     int64_t album_id;
     int64_t artist_id;
     int64_t folder_id;
@@ -68,6 +69,9 @@ int library_list_artists(LibArtist *out, int cap, int offset);
 int library_list_folders(int64_t parent_id, LibFolder *out, int cap);
 int library_list_playlists(LibPlaylist *out, int cap);
 int library_playlist_count(void);
+int library_list_songs_after(const char *title, int64_t id, LibTrack *out, int cap);
+int library_list_songs_before(const char *title, int64_t id, LibTrack *out, int cap);
+int library_list_songs_from_letter(uint32_t letter, LibTrack *out, int cap);
 int library_album_tracks(int64_t album_id, LibTrack *out, int cap);
 int library_artist_albums(int64_t artist_id, LibAlbum *out, int cap);
 int library_folder_tracks(int64_t folder_id, LibTrack *out, int cap);
@@ -89,6 +93,7 @@ int library_queue_add_album(int64_t album_id);
 int library_queue_add_artist(int64_t artist_id);
 int library_queue_add_folder(int64_t folder_id);
 int library_queue_add_playlist(int64_t playlist_id);
+int library_queue_add_all(void);
 int library_queue_has(int64_t track_id);
 /* 0 = none, 1 = some tracks, 2 = every track (and the collection is not empty). */
 int library_queue_cover_album(int64_t album_id);
@@ -135,6 +140,7 @@ int library_radio_fav_has(const char *url);
 int library_radio_fav_toggle(const char *name, const char *url, const char *sub);
 int library_radio_fav_count(void);
 int library_radio_fav_list(LibRadioCustom *out, int cap);
+int library_radio_fav_step(const char *url, int dir, LibRadioCustom *out);
 int library_radio_fav_remove(int64_t id);
 
 int library_artist_fav_has(int64_t artist_id);

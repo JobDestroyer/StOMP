@@ -9,6 +9,7 @@
 #include "config.h"
 #include "decode.h"
 #include "input.h"
+#include "karaoke.h"
 #include "library.h"
 #include "platform_sdl.h"
 #include "ringbuf.h"
@@ -39,6 +40,10 @@ typedef struct App {
     LibTrack now;
     int now_valid;
     int playing_radio;
+    int playing_karaoke;
+    uint32_t kara_gap_until;
+    uint32_t kara_gap_hold_ms;
+    int kara_menu_paused;
     char radio_url[VIBE_PATH_MAX];
     char status[128];
     float *ring_storage;
@@ -47,7 +52,7 @@ typedef struct App {
 } App;
 
 int app_run(int argc, char **argv);
-void app_play_track(App *app, const LibTrack *t);
+int app_play_track(App *app, const LibTrack *t);
 void app_play_radio(App *app, const char *title, const char *url, const char *subtitle);
 void app_play_queue_index(App *app, int idx);
 void app_next_track(App *app, int from_end);
@@ -57,9 +62,11 @@ void app_resume_playback(App *app);
 void app_stop(App *app);
 void app_halt(App *app);
 void app_seek_delta(App *app, double seconds);
+void app_seek_frac(App *app, float t);
 void app_set_volume_delta(App *app, float d);
 void app_apply_profile(App *app, int force);
 void app_persist(App *app);
 void app_restore_session(App *app);
+void app_set_karaoke_mode(App *app, int on);
 
 #endif

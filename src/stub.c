@@ -5,7 +5,7 @@
 /*
  * Single-file launcher. The packed stomp is: this stub + payload + trailer.
  * Payload is extracted once to $XDG_CACHE_HOME/vibe/r/<crc>/ then exec'd.
- * libprojectM stays a separate .so inside the payload (LGPL).
+ * libprojectM and the bundled LGPL FFmpeg stay separate .so files in the payload.
  */
 #define _POSIX_C_SOURCE 200809L
 
@@ -329,9 +329,6 @@ static int is_runtime_name(const char *name)
     if (name[8] == '\0') {
         return 1;
     }
-    if (strncmp(name + 8, ".part", 5) == 0 && (name[13] == '\0' || name[13] == '.')) {
-        return 1;
-    }
     return 0;
 }
 
@@ -505,15 +502,29 @@ int main(int argc, char **argv)
                 fclose(in);
                 return 1;
             }
-            if (write_stamp(tmp, crc) != 0 || rename(tmp, dir) != 0) {
+            if (write_stamp(tmp, crc) != 0) {
                 rm_tree(tmp);
+                fprintf(stderr, "StOMP: finalize runtime: %s\n", strerror(errno));
+                if (lk >= 0) {
+                    close(lk);
+                }
+                fclose(in);
+                return 1;
+            }
+            if (rename(tmp, dir) != 0) {
                 if (!ready(dir, crc)) {
-                    fprintf(stderr, "StOMP: finalize runtime: %s\n", strerror(errno));
-                    if (lk >= 0) {
-                        close(lk);
+                    rm_tree(dir);
+                    if (rename(tmp, dir) != 0) {
+                        rm_tree(tmp);
+                        fprintf(stderr, "StOMP: finalize runtime: %s\n", strerror(errno));
+                        if (lk >= 0) {
+                            close(lk);
+                        }
+                        fclose(in);
+                        return 1;
                     }
-                    fclose(in);
-                    return 1;
+                } else {
+                    rm_tree(tmp);
                 }
             }
             if (lk >= 0) {

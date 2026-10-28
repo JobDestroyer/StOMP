@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #define MPRIS_NAME "org.mpris.MediaPlayer2.StOMP"
 #define MPRIS_PATH "/org/mpris/MediaPlayer2"
@@ -92,7 +93,7 @@ static const char *playback_status(void)
 
 static int64_t pos_us(void)
 {
-    return (int64_t)(decode_position() * 1000000.0);
+    return (int64_t)(decode_play_position() * 1000000.0);
 }
 
 static int64_t len_us(void)
@@ -236,8 +237,8 @@ static void append_metadata(DBusMessageIter *parent)
             file_url(url, sizeof(url), s_app->now.path);
             urlp = url;
             dict_put_sv(&arr, urlk, DBUS_TYPE_STRING, &urlp);
-        } else if (strncmp(s_app->now.path, "http://", 7) == 0 ||
-                   strncmp(s_app->now.path, "https://", 8) == 0) {
+        } else if (strncasecmp(s_app->now.path, "http://", 7) == 0 ||
+                   strncasecmp(s_app->now.path, "https://", 8) == 0) {
             const char *urlp;
             snprintf(url, sizeof(url), "%s", s_app->now.path);
             urlp = url;
@@ -274,7 +275,7 @@ static void fill_player_all(DBusMessageIter *array, int include_pos)
     const char *status = playback_status();
     const char *loop;
     double rate = 1.0, vol, minr = 1.0, maxr = 1.0;
-    dbus_bool_t shuffle, can = TRUE;
+    dbus_bool_t shuffle, can = TRUE, can_seek = TRUE;
     int64_t pos;
     DBusMessageIter dict;
 
@@ -310,7 +311,8 @@ static void fill_player_all(DBusMessageIter *array, int include_pos)
     dict_put_sv(array, "CanGoPrevious", DBUS_TYPE_BOOLEAN, &can);
     dict_put_sv(array, "CanPlay", DBUS_TYPE_BOOLEAN, &can);
     dict_put_sv(array, "CanPause", DBUS_TYPE_BOOLEAN, &can);
-    dict_put_sv(array, "CanSeek", DBUS_TYPE_BOOLEAN, &can);
+    can_seek = !(s_app && (s_app->playing_radio || decode_is_live())) ? TRUE : FALSE;
+    dict_put_sv(array, "CanSeek", DBUS_TYPE_BOOLEAN, &can_seek);
     dict_put_sv(array, "CanControl", DBUS_TYPE_BOOLEAN, &can);
 }
 
@@ -366,7 +368,12 @@ static int get_prop(DBusMessage *msg, DBusMessage *reply)
             append_metadata(&out);
             return 1;
         }
-        if (strcmp(prop, "CanSeek") == 0 || strcmp(prop, "CanControl") == 0 ||
+        if (strcmp(prop, "CanSeek") == 0) {
+            dbus_bool_t t = !(s_app && (s_app->playing_radio || decode_is_live())) ? TRUE : FALSE;
+            append_basic_variant(&out, DBUS_TYPE_BOOLEAN, &t);
+            return 1;
+        }
+        if (strcmp(prop, "CanControl") == 0 ||
             strcmp(prop, "CanPlay") == 0 || strcmp(prop, "CanPause") == 0 ||
             strcmp(prop, "CanGoNext") == 0 || strcmp(prop, "CanGoPrevious") == 0) {
             dbus_bool_t t = TRUE;
@@ -431,7 +438,7 @@ static void handle_player_method(const char *member, DBusMessage *msg)
     if (strcmp(member, "PlayPause") == 0) {
         app_toggle_pause(s_app);
     } else if (strcmp(member, "Play") == 0) {
-        if (audio_paused()) {
+        if (!decode_has_file() || audio_paused()) {
             app_toggle_pause(s_app);
         }
     } else if (strcmp(member, "Pause") == 0) {
@@ -471,7 +478,7 @@ static void handle_player_method(const char *member, DBusMessage *msg)
             if (pos < 0) {
                 pos = 0;
             }
-            app_seek_delta(s_app, (double)pos / 1000000.0 - decode_position());
+            app_seek_delta(s_app, (double)pos / 1000000.0 - decode_play_position());
         }
     }
 }

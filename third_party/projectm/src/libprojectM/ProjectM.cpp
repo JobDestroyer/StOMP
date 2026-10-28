@@ -255,7 +255,7 @@ void ProjectM::StartPresetTransition(std::unique_ptr<Preset>&& preset, bool hard
     {
         m_transitioningPreset = std::move(preset);
         m_timeKeeper->StartSmoothing();
-        m_transition = std::make_unique<Renderer::PresetTransition>(m_transitionShaderManager->RandomTransition(), m_softCutDuration);
+        m_transition = std::make_unique<Renderer::PresetTransition>(m_transitionShaderManager->SimpleBlendTransition(), m_softCutDuration);
     }
 }
 

@@ -53,21 +53,50 @@ static void mkdir_p(const char *path)
     mkdir(buf, 0755);
 }
 
-int config_add_music_dir(VibeConfig *cfg, const char *path)
+static int path_within(const char *path, const char *root)
 {
-    char real[VIBE_PATH_MAX];
+    size_t n;
+    if (!path || !root || !root[0]) {
+        return 0;
+    }
+    n = strlen(root);
+    return strncmp(path, root, n) == 0 && (path[n] == '\0' || path[n] == '/');
+}
+
+static int path_overlap(const char *a, const char *b)
+{
+    return path_within(a, b) || path_within(b, a);
+}
+
+static int real_path(const char *path, char *real, size_t n)
+{
     char *rp;
-    if (!cfg || !path || !path[0]) {
+    if (!path || !path[0] || !real || n == 0) {
         return -1;
     }
     rp = realpath(path, NULL);
     if (rp) {
-        config_strlcpy(real, sizeof(real), rp);
+        config_strlcpy(real, n, rp);
         free(rp);
     } else {
-        config_strlcpy(real, sizeof(real), path);
+        config_strlcpy(real, n, path);
     }
-    for (int i = 0; i < cfg->music_dir_count; i++) {
+    return 0;
+}
+
+int config_add_music_dir(VibeConfig *cfg, const char *path)
+{
+    char real[VIBE_PATH_MAX];
+    int i;
+    if (!cfg || real_path(path, real, sizeof(real)) != 0) {
+        return -1;
+    }
+    for (i = 0; i < cfg->karaoke_dir_count; i++) {
+        if (path_overlap(real, cfg->karaoke_dirs[i])) {
+            return -2;
+        }
+    }
+    for (i = 0; i < cfg->music_dir_count; i++) {
         if (strcmp(cfg->music_dirs[i], real) == 0) {
             return 0;
         }
@@ -77,6 +106,31 @@ int config_add_music_dir(VibeConfig *cfg, const char *path)
     }
     config_strlcpy(cfg->music_dirs[cfg->music_dir_count], VIBE_PATH_MAX, real);
     cfg->music_dir_count++;
+    return 1;
+}
+
+int config_add_karaoke_dir(VibeConfig *cfg, const char *path)
+{
+    char real[VIBE_PATH_MAX];
+    int i;
+    if (!cfg || real_path(path, real, sizeof(real)) != 0) {
+        return -1;
+    }
+    for (i = 0; i < cfg->music_dir_count; i++) {
+        if (path_overlap(real, cfg->music_dirs[i])) {
+            return -2;
+        }
+    }
+    for (i = 0; i < cfg->karaoke_dir_count; i++) {
+        if (strcmp(cfg->karaoke_dirs[i], real) == 0) {
+            return 0;
+        }
+    }
+    if (cfg->karaoke_dir_count >= VIBE_MAX_MUSIC_DIRS) {
+        return -1;
+    }
+    config_strlcpy(cfg->karaoke_dirs[cfg->karaoke_dir_count], VIBE_PATH_MAX, real);
+    cfg->karaoke_dir_count++;
     return 1;
 }
 
@@ -91,6 +145,19 @@ void config_remove_music_dir(VibeConfig *cfg, int index)
     }
     cfg->music_dir_count--;
     cfg->music_dirs[cfg->music_dir_count][0] = '\0';
+}
+
+void config_remove_karaoke_dir(VibeConfig *cfg, int index)
+{
+    int i;
+    if (!cfg || index < 0 || index >= cfg->karaoke_dir_count) {
+        return;
+    }
+    for (i = index; i < cfg->karaoke_dir_count - 1; i++) {
+        memcpy(cfg->karaoke_dirs[i], cfg->karaoke_dirs[i + 1], VIBE_PATH_MAX);
+    }
+    cfg->karaoke_dir_count--;
+    cfg->karaoke_dirs[cfg->karaoke_dir_count][0] = '\0';
 }
 
 void config_profile_params(int effective_profile, VibeProfileParams *out)
@@ -188,6 +255,10 @@ static void load_conf_file(VibeConfig *cfg, const char *path)
         if (nl) {
             *nl = '\0';
         }
+        nl = strchr(line, '\r');
+        if (nl) {
+            *nl = '\0';
+        }
         if (line[0] == '#' || line[0] == '\0') {
             continue;
         }
@@ -216,6 +287,10 @@ static void load_conf_file(VibeConfig *cfg, const char *path)
             config_add_music_dir(cfg, val);
         } else if (strcmp(key, "music_user") == 0) {
             cfg->music_user = atoi(val) != 0;
+        } else if (strcmp(key, "karaoke_dir") == 0) {
+            config_add_karaoke_dir(cfg, val);
+        } else if (strcmp(key, "karaoke_mode") == 0) {
+            cfg->karaoke_mode = atoi(val) != 0;
         } else if (strcmp(key, "volume") == 0) {
             cfg->volume = (float)atof(val);
             if (cfg->volume < 0.f) {
@@ -234,6 +309,10 @@ static void load_conf_file(VibeConfig *cfg, const char *path)
             }
         } else if (strcmp(key, "start_library") == 0) {
             cfg->start_library = atoi(val) != 0;
+        } else if (strcmp(key, "np_keep_info") == 0) {
+            cfg->np_keep_info = atoi(val) != 0;
+        } else if (strcmp(key, "vsync") == 0) {
+            cfg->vsync = atoi(val) != 0;
         } else if (strcmp(key, "viz_shuffle") == 0) {
             cfg->viz_shuffle = atoi(val) != 0;
         } else if (strcmp(key, "audio_device") == 0) {
@@ -261,9 +340,15 @@ void config_save(const VibeConfig *cfg)
     for (int i = 0; i < cfg->music_dir_count; i++) {
         fprintf(f, "music_dir=%s\n", cfg->music_dirs[i]);
     }
+    for (int i = 0; i < cfg->karaoke_dir_count; i++) {
+        fprintf(f, "karaoke_dir=%s\n", cfg->karaoke_dirs[i]);
+    }
+    fprintf(f, "karaoke_mode=%d\n", cfg->karaoke_mode ? 1 : 0);
     fprintf(f, "volume=%.3f\n", (double)cfg->volume);
     fprintf(f, "profile=auto\n");
     fprintf(f, "start_library=%d\n", cfg->start_library ? 1 : 0);
+    fprintf(f, "np_keep_info=%d\n", cfg->np_keep_info ? 1 : 0);
+    fprintf(f, "vsync=%d\n", cfg->vsync ? 1 : 0);
     fprintf(f, "viz_shuffle=%d\n", cfg->viz_shuffle ? 1 : 0);
     if (cfg->audio_device[0]) {
         fprintf(f, "audio_device=%s\n", cfg->audio_device);
@@ -375,6 +460,7 @@ int config_init(VibeConfig *cfg, int argc, char **argv)
     memset(cfg, 0, sizeof(*cfg));
     cfg->volume = 1.0f;
     cfg->profile_mode = VIBE_PROFILE_AUTO;
+    cfg->vsync = 1;
     cfg->viz_shuffle = 0;
     memcpy(cfg->bindings, input_default_bindings(), sizeof(cfg->bindings));
 
@@ -385,6 +471,7 @@ int config_init(VibeConfig *cfg, int argc, char **argv)
     mkdir_p(cfg->data_dir);
     mkdir_p(cfg->cache_dir);
     snprintf(cfg->db_path, sizeof(cfg->db_path), "%s/library.db", cfg->data_dir);
+    snprintf(cfg->karaoke_db_path, sizeof(cfg->karaoke_db_path), "%s/karaoke.db", cfg->data_dir);
 
     if (find_dir(cfg->preset_dir, sizeof(cfg->preset_dir), "presets") != 0) {
         fprintf(stderr, "StOMP: presets/ not found next to binary or source tree\n");

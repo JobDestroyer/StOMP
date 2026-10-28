@@ -28,6 +28,24 @@ auto TransitionShaderManager::RandomTransition() -> std::shared_ptr<Shader>
     return m_transitionShaders.at(m_mersenneTwister() % m_transitionShaders.size());
 }
 
+auto TransitionShaderManager::SimpleBlendTransition() -> std::shared_ptr<Shader>
+{
+    // Constructor order: Circle, Plasma, SimpleBlend, Sweep, Warp, ZoomBlur
+    constexpr size_t kSimpleBlendIndex = 2;
+    if (m_transitionShaders.size() > kSimpleBlendIndex && m_transitionShaders[kSimpleBlendIndex])
+    {
+        return m_transitionShaders[kSimpleBlendIndex];
+    }
+    for (const auto& shader : m_transitionShaders)
+    {
+        if (shader)
+        {
+            return shader;
+        }
+    }
+    return {};
+}
+
 auto TransitionShaderManager::CompileTransitionShader(const std::string& shaderBodyCode) -> std::shared_ptr<Shader>
 {
 #ifdef USE_GLES

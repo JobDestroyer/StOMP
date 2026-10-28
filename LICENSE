@@ -7,6 +7,11 @@ published by the Free Software Foundation. The full license text follows.
 
 Third-party notices shipped with this tree:
   libprojectM 4.1.2 — LGPL-2.1 (third_party/projectm/LICENSE.txt)
+  FFmpeg 7.1.5 — LGPL-2.1-or-later (third_party/ffmpeg/COPYING.LGPLv2.1)
+    Built --disable-gpl --disable-nonfree as shared libraries packed next
+    to the inner player. HTTPS uses the system GnuTLS (LGPL). Source:
+    https://ffmpeg.org/releases/ffmpeg-7.1.5.tar.xz
+    (tools/build-bundled-ffmpeg.sh).
   SQLite 3.46.1 amalgamation — public domain (third_party/sqlite3.c)
   DejaVu Sans — fonts/LICENSE-DejaVu.txt
   Droid Sans Fallback — Apache 2.0 (fonts/LICENSE-Apache-2.0.txt)

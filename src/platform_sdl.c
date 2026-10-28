@@ -18,7 +18,22 @@ static int s_pad_count;
 static int s_win_w = 1920;
 static int s_win_h = 1080;
 static int s_windowed;
+static int s_vsync_want = 1;
+static int s_vsync_on;
 static char s_base[1024];
+
+static void apply_vsync(void)
+{
+    int want = s_vsync_want ? 1 : 0;
+    if (SDL_GL_SetSwapInterval(want) != 0) {
+        fprintf(stderr, "StOMP: vsync %s failed (%s)\n",
+                want ? "on" : "off", SDL_GetError());
+        s_vsync_on = 0;
+        return;
+    }
+    s_vsync_on = SDL_GL_GetSwapInterval() > 0;
+    fprintf(stderr, "StOMP: vsync %s\n", s_vsync_on ? "on" : "off");
+}
 
 static void open_all_pads(void)
 {
@@ -92,15 +107,25 @@ static int create_window_and_gl(void)
     }
     if (!s_gl) {
         fprintf(stderr, "StOMP: SDL_GL_CreateContext: %s\n", SDL_GetError());
+        SDL_DestroyWindow(s_win);
+        s_win = NULL;
         return -1;
     }
     if (SDL_GL_MakeCurrent(s_win, s_gl) != 0) {
         fprintf(stderr, "StOMP: SDL_GL_MakeCurrent: %s\n", SDL_GetError());
+        SDL_GL_DeleteContext(s_gl);
+        s_gl = NULL;
+        SDL_DestroyWindow(s_win);
+        s_win = NULL;
         return -1;
     }
-    SDL_GL_SetSwapInterval(0);
+    apply_vsync();
     SDL_GetWindowSize(s_win, &s_win_w, &s_win_h);
     if (plat_gl_load() != 0) {
+        SDL_GL_DeleteContext(s_gl);
+        s_gl = NULL;
+        SDL_DestroyWindow(s_win);
+        s_win = NULL;
         return -1;
     }
     {
@@ -180,6 +205,19 @@ int plat_poll(SDL_Event *ev)
 void plat_swap(void)
 {
     SDL_GL_SwapWindow(s_win);
+}
+
+void plat_set_vsync(int on)
+{
+    s_vsync_want = on ? 1 : 0;
+    if (s_gl) {
+        apply_vsync();
+    }
+}
+
+int plat_vsync(void)
+{
+    return s_vsync_on;
 }
 
 void plat_size(int *w, int *h)
@@ -322,7 +360,7 @@ int plat_recreate_gl(void)
         fprintf(stderr, "StOMP: recreate MakeCurrent: %s\n", SDL_GetError());
         return -1;
     }
-    SDL_GL_SetSwapInterval(0);
+    apply_vsync();
     return plat_gl_load();
 }
 

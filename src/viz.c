@@ -130,22 +130,21 @@ static int viz_cmp(const void *a, const void *b)
 {
     int ia = *(const int *)a;
     int ib = *(const int *)b;
-    int ba = name_bucket(s_pcat[ia]);
-    int bb = name_bucket(s_pcat[ib]);
+    int ba = name_bucket(s_pname[ia]);
+    int bb = name_bucket(s_pname[ib]);
     int c;
     if (ba != bb) {
         return ba - bb;
+    }
+    c = strcasecmp(s_pname[ia], s_pname[ib]);
+    if (c != 0) {
+        return c;
     }
     c = strcasecmp(s_pcat[ia], s_pcat[ib]);
     if (c != 0) {
         return c;
     }
-    ba = name_bucket(s_pname[ia]);
-    bb = name_bucket(s_pname[ib]);
-    if (ba != bb) {
-        return ba - bb;
-    }
-    return strcasecmp(s_pname[ia], s_pname[ib]);
+    return ia - ib;
 }
 
 static int viz_apply_rating(const char *key, int rating, void *ud)

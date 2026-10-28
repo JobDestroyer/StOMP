@@ -19,9 +19,12 @@ void decode_seek(double seconds);
 void decode_stop_file(void);
 int decode_has_file(void);
 int decode_is_live(void);
+/* 0 = ok, 1 = reconnecting, 2 = no connection (still retrying). */
+int decode_live_net(void);
 int decode_take_ended(void);
 int decode_take_failed(void);
 double decode_position(void);
+double decode_play_position(void);
 double decode_duration(void);
 void decode_meta(char *title, int tlen, char *artist, int alen, char *album, int blen);
 void decode_icy(char *out, int n);

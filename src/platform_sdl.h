@@ -93,6 +93,8 @@ SDL_Window *plat_window(void);
 SDL_GLContext plat_gl(void);
 int plat_poll(SDL_Event *ev);
 void plat_swap(void);
+void plat_set_vsync(int on);
+int plat_vsync(void);
 void plat_size(int *w, int *h);
 void plat_drawable_size(int *w, int *h);
 int plat_display_h(void);

@@ -5,6 +5,7 @@
 #include "decode.h"
 
 #include "audio.h"
+#include "karaoke.h"
 #include "library.h"
 
 #include <SDL.h>
@@ -22,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 enum {
     CMD_NONE = 0,
@@ -43,6 +45,8 @@ static double s_pending_seek = -1.0;
 static int s_paused;
 static int s_have_file;
 static int s_live;
+static atomic_int s_live_net;
+static atomic_uint s_last_pcm_ms;
 static atomic_int s_ended;
 static atomic_int s_failed;
 static atomic_int s_scan_busy;
@@ -53,6 +57,12 @@ static char s_artist[VIBE_NAME_MAX];
 static char s_album[VIBE_NAME_MAX];
 static char s_icy[VIBE_NAME_MAX];
 static float s_scratch[VIBE_DECODE_SCRATCH_FRAMES * 2];
+
+static int path_is_http(const char *path)
+{
+    return path && (strncasecmp(path, "http://", 7) == 0 ||
+                    strncasecmp(path, "https://", 8) == 0);
+}
 
 static void copy_meta_dict(AVDictionary *d, const char *key, char *out, int n)
 {
@@ -111,9 +121,9 @@ static int open_file(const char *path, AVFormatContext **fmt, AVCodecContext **c
 
     {
         AVDictionary *opts = NULL;
-        int net = path && (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0);
+        int net = path_is_http(path);
         if (net) {
-            av_dict_set(&opts, "protocol_whitelist", "file,http,https,tcp,tls,crypto,rtp,udp", 0);
+            av_dict_set(&opts, "protocol_whitelist", "http,https,tcp,tls,crypto,rtp,udp", 0);
             av_dict_set(&opts, "user_agent", "StOMP/1.0", 0);
             av_dict_set(&opts, "icy", "1", 0);
             av_dict_set(&opts, "reconnect", "1", 0);
@@ -185,7 +195,7 @@ static int open_file(const char *path, AVFormatContext **fmt, AVCodecContext **c
         } else if ((*fmt)->streams[si]->duration > 0) {
             dur = (*fmt)->streams[si]->duration * av_q2d((*fmt)->streams[si]->time_base);
         }
-        if (path && (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0)) {
+        if (path_is_http(path)) {
             dur = 0;
         }
         atomic_store(&s_dur_ms, dur > 0 ? (int)(dur * 1000.0 + 0.5) : 0);
@@ -242,6 +252,12 @@ static int write_pcm(const float *src, int frames)
             chunk = space;
         }
         ringbuf_write(s_ring, src + off * 2, chunk);
+        if (chunk > 0) {
+            atomic_store(&s_last_pcm_ms, SDL_GetTicks());
+            if (s_live) {
+                atomic_store(&s_live_net, 0);
+            }
+        }
         off += (int)chunk;
     }
     return 0;
@@ -297,6 +313,9 @@ static int scan_thread_main(void *ud)
     if (library_scan() != 0) {
         fprintf(stderr, "StOMP: library scan failed\n");
     }
+    if (karaoke_ok() && karaoke_scan() != 0) {
+        fprintf(stderr, "StOMP: karaoke scan failed\n");
+    }
     atomic_store(&s_scan_busy, 0);
     return 0;
 }
@@ -319,7 +338,8 @@ static int thread_main(void *ud)
     for (;;) {
         int cmd;
         SDL_LockMutex(s_mtx);
-        while (s_cmd == CMD_NONE && (s_paused || !s_have_file)) {
+        while (s_cmd == CMD_NONE && (s_paused || !s_have_file) &&
+               !(s_live && !s_paused && atomic_load(&s_live_net) != 0)) {
             SDL_CondWait(s_cond, s_mtx);
         }
         cmd = s_cmd;
@@ -330,12 +350,15 @@ static int thread_main(void *ud)
         if (cmd == CMD_OPEN) {
             char path[VIBE_PATH_MAX];
             double pending;
+            int live_try;
             snprintf(path, sizeof(path), "%s", s_path);
             snprintf(cur_path, sizeof(cur_path), "%s", path);
             pending = s_pending_seek;
             s_pending_seek = -1.0;
             s_cmd = CMD_NONE;
             s_have_file = 0;
+            live_try = path_is_http(path);
+            s_live = live_try;
             SDL_UnlockMutex(s_mtx);
             pkt_errs = 0;
             close_ctx(&fmt, &cc, &swr, &pkt, &fr);
@@ -344,8 +367,10 @@ static int thread_main(void *ud)
             audio_unlock();
             atomic_store(&s_ended, 0);
             atomic_store(&s_failed, 0);
+            atomic_store(&s_live_net, live_try ? 1 : 0);
+            atomic_store(&s_last_pcm_ms, 0);
             if (open_file(path, &fmt, &cc, &swr, &pkt, &fr, &stream_i) == 0) {
-                int live = (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0);
+                int live = path_is_http(path);
                 if (!live && pending >= 0.0 && stream_i >= 0) {
                     int64_t ts = (int64_t)(pending / av_q2d(fmt->streams[stream_i]->time_base));
                     av_seek_frame(fmt, stream_i, ts, AVSEEK_FLAG_BACKWARD);
@@ -359,11 +384,20 @@ static int thread_main(void *ud)
                 s_live = live;
                 s_have_file = 1;
                 SDL_UnlockMutex(s_mtx);
+                if (live) {
+                    atomic_store(&s_live_net, 0);
+                    atomic_store(&s_last_pcm_ms, SDL_GetTicks());
+                }
             } else {
                 fprintf(stderr, "StOMP: skip unreadable file\n");
-                atomic_store(&s_failed, 1);
                 SDL_LockMutex(s_mtx);
-                s_live = 0;
+                if (path_is_http(path)) {
+                    s_live = 1;
+                    atomic_store(&s_live_net, 2);
+                } else {
+                    atomic_store(&s_failed, 1);
+                    s_live = 0;
+                }
                 SDL_UnlockMutex(s_mtx);
             }
             continue;
@@ -372,11 +406,14 @@ static int thread_main(void *ud)
             s_cmd = CMD_NONE;
             s_have_file = 0;
             s_live = 0;
+            atomic_store(&s_live_net, 0);
+            atomic_store(&s_last_pcm_ms, 0);
             SDL_UnlockMutex(s_mtx);
             close_ctx(&fmt, &cc, &swr, &pkt, &fr);
             audio_lock();
             ringbuf_clear(s_ring);
             audio_unlock();
+            atomic_store(&s_pos_ms, 0);
             continue;
         }
         if (cmd == CMD_SEEK) {
@@ -401,7 +438,31 @@ static int thread_main(void *ud)
             }
             continue;
         }
-        SDL_UnlockMutex(s_mtx);
+        {
+            int live = s_live;
+            SDL_UnlockMutex(s_mtx);
+
+            if (!fmt && live && atomic_load(&s_live_net) != 0) {
+                SDL_Delay(atomic_load(&s_live_net) == 2 ? 2000 : 400);
+                SDL_LockMutex(s_mtx);
+                if (s_cmd != CMD_NONE || s_paused) {
+                    SDL_UnlockMutex(s_mtx);
+                    continue;
+                }
+                SDL_UnlockMutex(s_mtx);
+                if (open_file(cur_path, &fmt, &cc, &swr, &pkt, &fr, &stream_i) == 0) {
+                    SDL_LockMutex(s_mtx);
+                    s_live = 1;
+                    s_have_file = 1;
+                    SDL_UnlockMutex(s_mtx);
+                    atomic_store(&s_live_net, 0);
+                    atomic_store(&s_last_pcm_ms, SDL_GetTicks());
+                } else {
+                    atomic_store(&s_live_net, 2);
+                }
+                continue;
+            }
+        }
 
         if (!fmt || !cc || !swr) {
             SDL_Delay(10);
@@ -410,20 +471,11 @@ static int thread_main(void *ud)
 
         if (av_read_frame(fmt, pkt) < 0) {
             if (s_live) {
+                atomic_store(&s_live_net, 1);
                 close_ctx(&fmt, &cc, &swr, &pkt, &fr);
-                SDL_Delay(400);
                 SDL_LockMutex(s_mtx);
-                if (s_cmd != CMD_NONE) {
-                    SDL_UnlockMutex(s_mtx);
-                    continue;
-                }
+                s_have_file = 0;
                 SDL_UnlockMutex(s_mtx);
-                if (open_file(cur_path, &fmt, &cc, &swr, &pkt, &fr, &stream_i) != 0) {
-                    atomic_store(&s_failed, 1);
-                    SDL_LockMutex(s_mtx);
-                    s_have_file = 0;
-                    SDL_UnlockMutex(s_mtx);
-                }
                 continue;
             }
             avcodec_send_packet(cc, NULL);
@@ -503,11 +555,23 @@ int decode_start(RingBuf *rb)
     s_cond = SDL_CreateCond();
     if (!s_mtx || !s_cond) {
         fprintf(stderr, "StOMP: decode sync objects failed: %s\n", SDL_GetError());
+        if (s_cond) {
+            SDL_DestroyCond(s_cond);
+        }
+        if (s_mtx) {
+            SDL_DestroyMutex(s_mtx);
+        }
+        s_cond = NULL;
+        s_mtx = NULL;
         return -1;
     }
     s_thread = SDL_CreateThread(thread_main, "vibe-decode", NULL);
     if (!s_thread) {
         fprintf(stderr, "StOMP: decode thread: %s\n", SDL_GetError());
+        SDL_DestroyCond(s_cond);
+        SDL_DestroyMutex(s_mtx);
+        s_cond = NULL;
+        s_mtx = NULL;
         return -1;
     }
     return 0;
@@ -546,6 +610,9 @@ int decode_open_at(const char *path, int paused, double seek_sec)
     s_pending_seek = seek_sec;
     s_paused = paused ? 1 : 0;
     s_cmd = CMD_OPEN;
+    atomic_store(&s_ended, 0);
+    atomic_store(&s_failed, 0);
+    atomic_store(&s_live_net, path_is_http(path) ? 1 : 0);
     SDL_CondSignal(s_cond);
     SDL_UnlockMutex(s_mtx);
     return 0;
@@ -599,6 +666,9 @@ void decode_stop_file(void)
     }
     SDL_LockMutex(s_mtx);
     s_cmd = CMD_STOP;
+    atomic_store(&s_ended, 0);
+    atomic_store(&s_failed, 0);
+    atomic_store(&s_pos_ms, 0);
     SDL_CondSignal(s_cond);
     SDL_UnlockMutex(s_mtx);
 }
@@ -627,6 +697,39 @@ int decode_is_live(void)
     return v;
 }
 
+int decode_live_net(void)
+{
+    int st, live, have, paused;
+    uint32_t last, now, fill;
+
+    if (!s_mtx) {
+        return 0;
+    }
+    SDL_LockMutex(s_mtx);
+    live = s_live;
+    have = s_have_file;
+    paused = s_paused;
+    SDL_UnlockMutex(s_mtx);
+    if (!live || paused) {
+        return 0;
+    }
+    last = atomic_load(&s_last_pcm_ms);
+    now = SDL_GetTicks();
+    fill = s_ring ? ringbuf_fill(s_ring) : 0;
+    /* Audio is arriving or still in the ring: the station is up. */
+    if ((last && now - last < 2500) || fill > 0) {
+        return 0;
+    }
+    st = atomic_load(&s_live_net);
+    if (st != 0) {
+        return st;
+    }
+    if (have && last && now - last > 2500 && fill == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 int decode_take_ended(void)
 {
     return atomic_exchange(&s_ended, 0);
@@ -640,6 +743,20 @@ int decode_take_failed(void)
 double decode_position(void)
 {
     return (double)atomic_load(&s_pos_ms) / 1000.0;
+}
+
+double decode_play_position(void)
+{
+    double pos = decode_position();
+    uint32_t fill = 0;
+    if (s_ring) {
+        fill = ringbuf_fill(s_ring);
+    }
+    pos -= (double)fill / (double)VIBE_SAMPLE_RATE;
+    if (pos < 0.0) {
+        pos = 0.0;
+    }
+    return pos;
 }
 
 double decode_duration(void)

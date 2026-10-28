@@ -33,6 +33,7 @@ int radio_fetch_stations(const char *country_code, char *err, int errn);
 int radio_station_count(void);
 int radio_station_at(int i, RadioItem *out);
 
+int radio_url_is_http(const char *u);
 int radio_resolve_play_url(const char *in, char *out, int n);
 void radio_name_from_url(const char *url, char *out, int n);
 

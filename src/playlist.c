@@ -234,9 +234,12 @@ static int parse_pls(FILE *fp, PlEntry *out, int cap)
     char (*titles)[VIBE_NAME_MAX];
     unsigned char *used;
     int i, n = 0, maxn = 0;
-    files = calloc(512, sizeof(*files));
-    titles = calloc(512, sizeof(*titles));
-    used = calloc(512, 1);
+    if (cap <= 0) {
+        return 0;
+    }
+    files = calloc((size_t)cap, sizeof(*files));
+    titles = calloc((size_t)cap, sizeof(*titles));
+    used = calloc((size_t)cap, 1);
     if (!files || !titles || !used) {
         free(files);
         free(titles);
@@ -259,7 +262,7 @@ static int parse_pls(FILE *fp, PlEntry *out, int cap)
         trim(eq);
         if (strncasecmp(line, "File", 4) == 0 && isdigit((unsigned char)line[4])) {
             idx = atoi(line + 4);
-            if (idx >= 1 && idx <= 512) {
+            if (idx >= 1 && idx <= cap) {
                 snprintf(files[idx - 1], sizeof(files[0]), "%s", eq);
                 used[idx - 1] = 1;
                 if (idx > maxn) {
@@ -268,7 +271,7 @@ static int parse_pls(FILE *fp, PlEntry *out, int cap)
             }
         } else if (strncasecmp(line, "Title", 5) == 0 && isdigit((unsigned char)line[5])) {
             idx = atoi(line + 5);
-            if (idx >= 1 && idx <= 512) {
+            if (idx >= 1 && idx <= cap) {
                 snprintf(titles[idx - 1], sizeof(titles[0]), "%s", eq);
                 if (idx > maxn) {
                     maxn = idx;

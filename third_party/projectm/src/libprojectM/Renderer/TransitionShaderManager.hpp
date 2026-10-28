@@ -21,6 +21,12 @@ public:
      */
     auto RandomTransition() -> std::shared_ptr<Shader>;
 
+    /**
+     * @brief Linear crossfade between the old and new preset.
+     * @return A shared pointer to the SimpleBlend transition shader.
+     */
+    auto SimpleBlendTransition() -> std::shared_ptr<Shader>;
+
 private:
     /**
      * @brief Compiles a single transition shader program.

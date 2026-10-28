@@ -14,6 +14,7 @@ typedef enum {
     UI_VIEW_NOW_PLAYING = 0,
     UI_VIEW_LIBRARY,
     UI_VIEW_ALBUMS,
+    UI_VIEW_SONGS,
     UI_VIEW_ALBUM_TRACKS,
     UI_VIEW_ARTISTS,
     UI_VIEW_ARTIST_ALBUMS,
@@ -39,7 +40,10 @@ typedef enum {
     UI_VIEW_RADIO_COUNTRIES,
     UI_VIEW_RADIO_STATIONS,
     UI_VIEW_RADIO_CUSTOM,
-    UI_VIEW_RADIO_ADD
+    UI_VIEW_RADIO_ADD,
+    UI_VIEW_GENRES,
+    UI_VIEW_GENRE_SONGS,
+    UI_VIEW_SONG_FAVORITES
 } UiView;
 
 int ui_init(int win_w, int win_h, float veil);
@@ -51,9 +55,10 @@ UiView ui_view(void);
 void ui_show_overlay(void);
 void ui_hide_overlay(void);
 int ui_overlay_visible(void);
-void ui_idle_tick(uint32_t now_ms);
+void ui_idle_tick(struct App *app, uint32_t now_ms);
 void ui_note_input(uint32_t now_ms);
 int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat);
+int ui_mouse(struct App *app, const SDL_Event *ev);
 void ui_draw(struct App *app);
 void ui_refresh_lists(struct App *app);
 void ui_text_input(const char *text);
@@ -73,7 +78,8 @@ enum {
     UI_KIND_PLAYLIST,
     UI_KIND_SETTING,
     UI_KIND_PRESET,
-    UI_KIND_RADIO
+    UI_KIND_RADIO,
+    UI_KIND_GENRE
 };
 
 #endif

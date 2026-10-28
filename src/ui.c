@@ -25,6 +25,7 @@
 #define GLYPH_CACHE 2048
 #define UI_STACK 8
 #define FOLDER_STACK 16
+#define SONG_WIN 32
 
 typedef struct {
     float x, y, u, v, r, g, b, a;
@@ -45,6 +46,16 @@ typedef struct {
 static Vtx s_vtx[UI_MAX_VTX];
 static int s_nv;
 static unsigned s_prog, s_vao, s_vbo, s_atlas, s_white;
+static unsigned s_lock_tex[2];
+static unsigned s_speaker_tex;
+static unsigned s_eye_tex[2];
+static unsigned s_shuf_tex[2];
+static unsigned s_rep_tex[3];
+static unsigned s_live_dot_tex;
+static unsigned s_jumbo_tex;
+static uint32_t s_jumbo_cp;
+static int s_jumbo_px;
+static float s_jumbo_ax, s_jumbo_ay, s_jumbo_bw, s_jumbo_bh;
 static int s_u_res, s_u_tex, s_u_mode;
 static Glyph s_gcache[GLYPH_CACHE];
 static uint32_t s_gcp[GLYPH_CACHE];
@@ -97,7 +108,38 @@ static int s_folder_scroll[FOLDER_STACK];
 static int s_folder_sp;
 static int s_vol_open;
 static float s_vol_draft;
-static float s_vol_saved;
+static int s_vol_wheel;
+static int s_mouse_drag; /* 1 = seek, 2 = volume */
+static int s_cursor_on = 1;
+static int s_hover_row = -1;
+
+enum { CTX_NMAX = 6 };
+enum {
+    CTX_ACT_PLAY = 1,
+    CTX_ACT_QUEUE,
+    CTX_ACT_FAV,
+    CTX_ACT_UNFAV,
+    CTX_ACT_REMOVE_Q,
+    CTX_ACT_REMOVE_DIR,
+    CTX_ACT_REMOVE_RADIO
+};
+static int s_ctx_on;
+static float s_ctx_x, s_ctx_y, s_ctx_w, s_ctx_ih;
+static int s_ctx_n;
+static int s_ctx_act[CTX_NMAX];
+static char s_ctx_lab[CTX_NMAX][48];
+static int s_ctx_row;
+static int s_ctx_hover;
+
+static struct {
+    float strip_y, strip_h;
+    float bar_x, bar_y, bar_w, bar_h, bar_hit;
+    float opt_y, sq, chip_h;
+    float bx[NP_OPT_MAX + 1];
+    float bw[NP_OPT_MAX + 1];
+    float vol_px, vol_py, vol_pw, vol_ph;
+    float vol_tx, vol_ty, vol_tw, vol_th;
+} s_np;
 static uint32_t s_rate_flash_ms;
 static int s_rate_flash_good;
 static char s_radio_cc[8];
@@ -112,6 +154,9 @@ static int s_quit_choice;
 static int s_bind_capture;
 static int s_bind_target;
 static char s_folder_title[VIBE_NAME_MAX];
+static int s_karaoke;
+static char s_kara_genre[VIBE_NAME_MAX];
+static int s_dir_karaoke;
 static int s_settings_audio_i;
 static char s_pl_name[VIBE_NAME_MAX];
 static char s_browse[VIBE_PATH_MAX];
@@ -634,6 +679,103 @@ static Glyph *glyph_get(uint32_t cp)
     return hit;
 }
 
+static FT_Face face_for_cp(uint32_t cp)
+{
+    int i;
+    for (i = 0; i < s_nfaces; i++) {
+        if (s_faces[i] && FT_Get_Char_Index(s_faces[i], (FT_ULong)cp) != 0) {
+            return s_faces[i];
+        }
+    }
+    return s_nfaces > 0 ? s_faces[0] : NULL;
+}
+
+static int ensure_jumbo(uint32_t cp, int px)
+{
+    FT_Face face;
+    FT_UInt idx;
+    int bw, bh, pitch, row, col;
+    const unsigned char *buf;
+    unsigned char *rgba;
+
+    if (cp == 0 || px < 8 || !s_ft) {
+        return -1;
+    }
+    if (px > 256) {
+        px = 256;
+    }
+    if (s_jumbo_tex && s_jumbo_cp == cp && s_jumbo_px == px) {
+        return 0;
+    }
+    face = face_for_cp(cp);
+    if (!face) {
+        return -1;
+    }
+    idx = FT_Get_Char_Index(face, (FT_ULong)cp);
+    if (idx == 0) {
+        face = face_for_cp('?');
+        if (!face) {
+            return -1;
+        }
+        idx = FT_Get_Char_Index(face, (FT_ULong)'?');
+        cp = '?';
+        if (idx == 0) {
+            return -1;
+        }
+    }
+    if (FT_Set_Pixel_Sizes(face, 0, (FT_UInt)px) != 0) {
+        return -1;
+    }
+    if (FT_Load_Glyph(face, idx, FT_LOAD_RENDER | FT_LOAD_TARGET_NORMAL) != 0 ||
+        face->glyph->bitmap.pixel_mode != FT_PIXEL_MODE_GRAY) {
+        FT_Set_Pixel_Sizes(face, 0, (FT_UInt)s_size_px);
+        return -1;
+    }
+    bw = (int)face->glyph->bitmap.width;
+    bh = (int)face->glyph->bitmap.rows;
+    pitch = (int)face->glyph->bitmap.pitch;
+    buf = face->glyph->bitmap.buffer;
+    s_jumbo_ax = (float)face->glyph->bitmap_left;
+    s_jumbo_ay = (float)face->glyph->bitmap_top;
+    s_jumbo_bw = (float)bw;
+    s_jumbo_bh = (float)bh;
+    s_jumbo_cp = cp;
+    s_jumbo_px = px;
+    if (bw < 1 || bh < 1 || !buf || pitch == 0) {
+        FT_Set_Pixel_Sizes(face, 0, (FT_UInt)s_size_px);
+        return 0;
+    }
+    rgba = (unsigned char *)malloc((size_t)bw * (size_t)bh * 4u);
+    if (!rgba) {
+        FT_Set_Pixel_Sizes(face, 0, (FT_UInt)s_size_px);
+        return -1;
+    }
+    for (row = 0; row < bh; row++) {
+        const unsigned char *srow = buf + row * pitch;
+        unsigned char *drow = rgba + (size_t)row * (size_t)bw * 4u;
+        for (col = 0; col < bw; col++) {
+            unsigned char a = srow[col];
+            drow[col * 4 + 0] = 255;
+            drow[col * 4 + 1] = 255;
+            drow[col * 4 + 2] = 255;
+            drow[col * 4 + 3] = a;
+        }
+    }
+    if (!s_jumbo_tex) {
+        glGenTextures(1, &s_jumbo_tex);
+    }
+    glBindTexture(GL_TEXTURE_2D, s_jumbo_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, bw, bh, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    free(rgba);
+    FT_Set_Pixel_Sizes(face, 0, (FT_UInt)s_size_px);
+    return 0;
+}
+
 static void font_shutdown(void)
 {
     int i;
@@ -762,6 +904,10 @@ static int build_prog(void)
 
 static int kb_on(void);
 static void sync_text_input(void);
+static void load_hud_icons(void);
+static void blit_hud(unsigned tex, float x, float y, float s);
+static void mouse_cursor(int on);
+static void draw_ctx_menu(void);
 
 int ui_init(int win_w, int win_h, float veil)
 {
@@ -780,7 +926,10 @@ int ui_init(int win_w, int win_h, float veil)
     if (load_font() != 0) {
         fprintf(stderr, "StOMP: continuing without a font atlas\n");
     }
+    load_hud_icons();
     sync_text_input();
+    s_cursor_on = 1;
+    mouse_cursor(0);
     return 0;
 }
 
@@ -793,6 +942,55 @@ void ui_shutdown(void)
     if (s_white) {
         glDeleteTextures(1, &s_white);
     }
+    if (s_lock_tex[0]) {
+        glDeleteTextures(1, &s_lock_tex[0]);
+    }
+    if (s_lock_tex[1]) {
+        glDeleteTextures(1, &s_lock_tex[1]);
+    }
+    s_lock_tex[0] = s_lock_tex[1] = 0;
+    if (s_speaker_tex) {
+        glDeleteTextures(1, &s_speaker_tex);
+        s_speaker_tex = 0;
+    }
+    if (s_eye_tex[0]) {
+        glDeleteTextures(1, &s_eye_tex[0]);
+        s_eye_tex[0] = 0;
+    }
+    if (s_eye_tex[1]) {
+        glDeleteTextures(1, &s_eye_tex[1]);
+        s_eye_tex[1] = 0;
+    }
+    if (s_shuf_tex[0]) {
+        glDeleteTextures(1, &s_shuf_tex[0]);
+        s_shuf_tex[0] = 0;
+    }
+    if (s_shuf_tex[1]) {
+        glDeleteTextures(1, &s_shuf_tex[1]);
+        s_shuf_tex[1] = 0;
+    }
+    if (s_rep_tex[0]) {
+        glDeleteTextures(1, &s_rep_tex[0]);
+        s_rep_tex[0] = 0;
+    }
+    if (s_rep_tex[1]) {
+        glDeleteTextures(1, &s_rep_tex[1]);
+        s_rep_tex[1] = 0;
+    }
+    if (s_rep_tex[2]) {
+        glDeleteTextures(1, &s_rep_tex[2]);
+        s_rep_tex[2] = 0;
+    }
+    if (s_live_dot_tex) {
+        glDeleteTextures(1, &s_live_dot_tex);
+        s_live_dot_tex = 0;
+    }
+    if (s_jumbo_tex) {
+        glDeleteTextures(1, &s_jumbo_tex);
+        s_jumbo_tex = 0;
+    }
+    s_jumbo_cp = 0;
+    s_jumbo_px = 0;
     if (s_vbo) {
         glDeleteBuffers(1, &s_vbo);
     }
@@ -864,13 +1062,36 @@ static void sync_text_input(void)
     }
 }
 
+static void karaoke_np_hide(void)
+{
+    s_overlay = 0;
+    s_idle_on = 1;
+    s_np_opt = 0;
+    s_vol_open = 0;
+}
+
+static void karaoke_goto_playing(void)
+{
+    s_view = UI_VIEW_NOW_PLAYING;
+    s_sp = 0;
+    karaoke_np_hide();
+}
+
 void ui_set_view(UiView v)
 {
     s_view = v;
-    s_overlay = 1;
-    s_idle_on = 0;
     if (v == UI_VIEW_NOW_PLAYING) {
         s_np_opt = 0;
+        if (s_karaoke) {
+            s_overlay = 0;
+            s_idle_on = 1;
+        } else {
+            s_overlay = 1;
+            s_idle_on = 0;
+        }
+    } else {
+        s_overlay = 1;
+        s_idle_on = 0;
     }
     sync_text_input();
 }
@@ -884,6 +1105,7 @@ void ui_show_overlay(void)
 {
     s_overlay = 1;
     s_idle_on = 0;
+    s_last_input = SDL_GetTicks();
 }
 
 void ui_hide_overlay(void)
@@ -930,18 +1152,44 @@ void ui_binding_captured(int button)
 void ui_note_input(uint32_t now_ms)
 {
     s_last_input = now_ms;
+    if (s_karaoke && s_view == UI_VIEW_NOW_PLAYING && !s_overlay) {
+        return;
+    }
     s_overlay = 1;
     s_idle_on = 0;
 }
 
-void ui_idle_tick(uint32_t now_ms)
+static void mouse_cursor(int on)
 {
+    if (on == s_cursor_on) {
+        return;
+    }
+    s_cursor_on = on;
+    SDL_ShowCursor(on ? SDL_ENABLE : SDL_DISABLE);
+}
+
+void ui_idle_tick(struct App *app, uint32_t now_ms)
+{
+    int keep;
     if (s_vol_open) {
         return;
     }
-    if (s_view == UI_VIEW_NOW_PLAYING && s_overlay && (now_ms - s_last_input) > 4000) {
-        s_overlay = 0;
-        s_idle_on = 1;
+    keep = app && app->cfg.np_keep_info && !s_karaoke;
+    if (keep) {
+        if (s_view == UI_VIEW_NOW_PLAYING) {
+            s_overlay = 1;
+            s_idle_on = 0;
+        }
+        return;
+    }
+    if (s_view == UI_VIEW_NOW_PLAYING && (now_ms - s_last_input) > 4000) {
+        if (s_overlay) {
+            s_overlay = 0;
+            s_idle_on = 1;
+            s_ctx_on = 0;
+            s_mouse_drag = 0;
+        }
+        mouse_cursor(0);
     }
 }
 
@@ -993,7 +1241,11 @@ static void pop_view(void)
         s_focus = 0;
         s_scroll = 0;
     }
-    s_overlay = 1;
+    if (s_karaoke && s_view == UI_VIEW_NOW_PLAYING) {
+        karaoke_np_hide();
+    } else {
+        s_overlay = 1;
+    }
     sync_text_input();
 }
 
@@ -1010,17 +1262,58 @@ static void add_row(const char *line, const char *sub, int64_t id, int kind)
     r->kind = kind;
 }
 
+static int queue_has_id(int64_t id)
+{
+    return s_karaoke ? karaoke_queue_has(id) : library_queue_has(id);
+}
+
+static int song_get(int64_t id, LibTrack *t)
+{
+    return s_karaoke ? karaoke_get_song(id, t) : library_get_track(id, t);
+}
+
+static int songs_after(const char *title, int64_t id, LibTrack *out, int cap)
+{
+    return s_karaoke ? karaoke_list_songs_after(title, id, out, cap)
+                     : library_list_songs_after(title, id, out, cap);
+}
+
+static int songs_before(const char *title, int64_t id, LibTrack *out, int cap)
+{
+    return s_karaoke ? karaoke_list_songs_before(title, id, out, cap)
+                     : library_list_songs_before(title, id, out, cap);
+}
+
+static int songs_from_letter(uint32_t letter, LibTrack *out, int cap)
+{
+    return s_karaoke ? karaoke_list_songs_from_letter(letter, out, cap)
+                     : library_list_songs_from_letter(letter, out, cap);
+}
+
+static void sync_karaoke(const struct App *app)
+{
+    s_karaoke = app && app->cfg.karaoke_mode;
+}
+
 static void add_track_row(const char *title, const char *base, int64_t id)
 {
-    char marked[160];
+    char qmark[192], fmark[192];
     const char *use = base ? base : "";
-    if (library_queue_has(id)) {
+    if (queue_has_id(id)) {
         if (use[0]) {
-            snprintf(marked, sizeof(marked), "%s  ·  On Current Playlist", use);
+            snprintf(qmark, sizeof(qmark), "%s  ·  On Current Playlist", use);
         } else {
-            snprintf(marked, sizeof(marked), "On Current Playlist");
+            snprintf(qmark, sizeof(qmark), "On Current Playlist");
         }
-        use = marked;
+        use = qmark;
+    }
+    if (s_karaoke && karaoke_song_fav_has(id)) {
+        if (use[0]) {
+            snprintf(fmark, sizeof(fmark), "%s  ·  Favorite", use);
+        } else {
+            snprintf(fmark, sizeof(fmark), "Favorite");
+        }
+        use = fmark;
     }
     add_row(title, use, id, UI_KIND_TRACK);
 }
@@ -1329,6 +1622,251 @@ static void clamp_focus(void)
     }
 }
 
+static int songs_win(void)
+{
+    int n = list_vis_rows() + 4;
+    if (n < 12) {
+        n = 12;
+    }
+    if (n > SONG_WIN) {
+        n = SONG_WIN;
+    }
+    return n;
+}
+
+static int songs_first_track(void)
+{
+    int i;
+    for (i = 0; i < s_nrows; i++) {
+        if (s_rows[i].kind == UI_KIND_TRACK) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int songs_last_track(void)
+{
+    int i;
+    for (i = s_nrows - 1; i >= 0; i--) {
+        if (s_rows[i].kind == UI_KIND_TRACK) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int songs_track_key(int idx, char *title, int title_n, int64_t *id)
+{
+    LibTrack t;
+    if (idx < 0 || idx >= s_nrows || s_rows[idx].kind != UI_KIND_TRACK) {
+        return -1;
+    }
+    if (song_get(s_rows[idx].id, &t) != 0) {
+        return -1;
+    }
+    snprintf(title, (size_t)title_n, "%s", t.title);
+    *id = t.id;
+    return 0;
+}
+
+static void songs_add_track(const LibTrack *t)
+{
+    add_track_row(t->title, t->artist, t->id);
+}
+
+static void songs_write_track(int idx, const LibTrack *t)
+{
+    Row *r;
+    char marked[160];
+    const char *use;
+    if (idx < 0 || idx >= VIBE_UI_ROWS_MAX || !t) {
+        return;
+    }
+    r = &s_rows[idx];
+    snprintf(r->line, sizeof(r->line), "%s", t->title);
+    use = t->artist;
+    if (queue_has_id(t->id)) {
+        if (use[0]) {
+            snprintf(marked, sizeof(marked), "%s  ·  On Current Playlist", use);
+        } else {
+            snprintf(marked, sizeof(marked), "On Current Playlist");
+        }
+        use = marked;
+    }
+    if (s_karaoke && karaoke_song_fav_has(t->id)) {
+        if (use[0]) {
+            char extra[192];
+            snprintf(extra, sizeof(extra), "%s  ·  Favorite", use);
+            snprintf(marked, sizeof(marked), "%s", extra);
+        } else {
+            snprintf(marked, sizeof(marked), "Favorite");
+        }
+        use = marked;
+    }
+    snprintf(r->sub, sizeof(r->sub), "%s", use);
+    r->id = t->id;
+    r->kind = UI_KIND_TRACK;
+}
+
+static void songs_write_shuffle(int idx)
+{
+    Row *r;
+    if (idx < 0 || idx >= VIBE_UI_ROWS_MAX) {
+        return;
+    }
+    r = &s_rows[idx];
+    snprintf(r->line, sizeof(r->line), "Shuffle All");
+    snprintf(r->sub, sizeof(r->sub),
+             s_karaoke ? "Turn on shuffle, queue every karaoke song, play a random one"
+                       : "Turn on shuffle, queue the whole library, play a random song");
+    r->id = 1;
+    r->kind = UI_KIND_ACTION;
+}
+
+static int songs_slide_down(void)
+{
+    LibTrack one;
+    char title[VIBE_NAME_MAX];
+    int64_t id;
+    int i = songs_last_track();
+    if (i < 0 || songs_track_key(i, title, (int)sizeof(title), &id) != 0) {
+        return 0;
+    }
+    if (songs_after(title, id, &one, 1) != 1) {
+        return 0;
+    }
+    if (s_nrows >= songs_win()) {
+        memmove(&s_rows[0], &s_rows[1], (size_t)(s_nrows - 1) * sizeof(s_rows[0]));
+        s_nrows--;
+        if (s_focus > 0) {
+            s_focus--;
+        }
+        if (s_scroll > 0) {
+            s_scroll--;
+        }
+    }
+    if (s_nrows >= VIBE_UI_ROWS_MAX) {
+        return 1;
+    }
+    songs_write_track(s_nrows, &one);
+    s_nrows++;
+    s_focus = s_nrows - 1;
+    clamp_focus();
+    return 1;
+}
+
+static int songs_slide_up(void)
+{
+    LibTrack one;
+    char title[VIBE_NAME_MAX];
+    int64_t id;
+    int i;
+    int win = songs_win();
+    int have;
+    if (s_nrows > 0 && s_rows[0].kind == UI_KIND_ACTION && s_rows[0].id == 1) {
+        return 0;
+    }
+    i = songs_first_track();
+    have = (i >= 0 && songs_track_key(i, title, (int)sizeof(title), &id) == 0 &&
+            songs_before(title, id, &one, 1) == 1);
+    if (s_nrows >= win && s_nrows > 0) {
+        s_nrows--;
+    }
+    if (s_nrows >= VIBE_UI_ROWS_MAX) {
+        return 1;
+    }
+    memmove(&s_rows[1], &s_rows[0], (size_t)s_nrows * sizeof(s_rows[0]));
+    s_nrows++;
+    if (have) {
+        songs_write_track(0, &one);
+    } else {
+        songs_write_shuffle(0);
+    }
+    s_focus = 0;
+    s_scroll = 0;
+    clamp_focus();
+    return 1;
+}
+
+static void songs_load_tracks(const LibTrack *buf, int n, int with_shuffle)
+{
+    int i;
+    s_nrows = 0;
+    s_scroll = 0;
+    if (with_shuffle) {
+        add_row("Shuffle All",
+                s_karaoke ? "Turn on shuffle, queue every karaoke song, play a random one"
+                          : "Turn on shuffle, queue the whole library, play a random song",
+                1, UI_KIND_ACTION);
+    }
+    for (i = 0; i < n; i++) {
+        songs_add_track(&buf[i]);
+    }
+    if (s_nrows <= (with_shuffle ? 1 : 0)) {
+        add_row("No songs yet",
+                s_karaoke ? "Set a karaoke folder in Settings" : "Scan a music folder in Settings",
+                0, UI_KIND_ACTION);
+    }
+}
+
+static void songs_fill_start(void)
+{
+    LibTrack buf[SONG_WIN];
+    int n = songs_after("", 0, buf, songs_win());
+    songs_load_tracks(buf, n, 1);
+    s_focus = 0;
+    clamp_focus();
+}
+
+static void songs_fill_end(void)
+{
+    LibTrack buf[SONG_WIN];
+    int n = songs_before("", 0, buf, songs_win());
+    if (n <= 0) {
+        songs_fill_start();
+        return;
+    }
+    songs_load_tracks(buf, n, 0);
+    s_focus = s_nrows > 0 ? s_nrows - 1 : 0;
+    clamp_focus();
+}
+
+static int songs_at_library_start(const LibTrack *first)
+{
+    LibTrack pred;
+    if (!first || first->id <= 0) {
+        return 1;
+    }
+    return songs_before(first->title, first->id, &pred, 1) == 0;
+}
+
+static void songs_show_at(const char *title, int64_t id)
+{
+    LibTrack buf[SONG_WIN];
+    LibTrack pred;
+    int n, i, at_start;
+    if (id > 0 && songs_before(title ? title : "", id, &pred, 1) == 1) {
+        n = songs_after(pred.title, pred.id, buf, songs_win());
+    } else {
+        n = songs_after("", 0, buf, songs_win());
+    }
+    if (n <= 0) {
+        songs_fill_start();
+        return;
+    }
+    at_start = songs_at_library_start(&buf[0]);
+    songs_load_tracks(buf, n, at_start);
+    s_focus = 0;
+    for (i = 0; i < s_nrows; i++) {
+        if (s_rows[i].kind == UI_KIND_TRACK && s_rows[i].id == id) {
+            s_focus = i;
+            break;
+        }
+    }
+    clamp_focus();
+}
+
 static void path_basename(const char *path, char *out, size_t n)
 {
     const char *slash;
@@ -1369,6 +1907,58 @@ static void apply_music_dirs(struct App *app)
     decode_request_scan();
     config_save(&app->cfg);
     snprintf(app->status, sizeof(app->status), "Scanning…");
+}
+
+static void apply_karaoke_dirs(struct App *app)
+{
+    if (!app) {
+        return;
+    }
+    karaoke_set_scan_roots(app->cfg.karaoke_dirs, app->cfg.karaoke_dir_count);
+    decode_request_scan();
+    config_save(&app->cfg);
+    snprintf(app->status, sizeof(app->status), "Scanning karaoke…");
+}
+
+static void enter_karaoke_mode(struct App *app)
+{
+    app_set_karaoke_mode(app, 1);
+    s_karaoke = 1;
+    s_sp = 0;
+    s_view = UI_VIEW_LIBRARY;
+    s_focus = 0;
+    s_scroll = 0;
+    s_overlay = 1;
+    ui_refresh_lists(app);
+}
+
+static void leave_karaoke_mode(struct App *app)
+{
+    app_set_karaoke_mode(app, 0);
+    s_karaoke = 0;
+    s_sp = 0;
+    s_view = UI_VIEW_LIBRARY;
+    s_focus = 0;
+    s_scroll = 0;
+    s_overlay = 1;
+    ui_refresh_lists(app);
+}
+
+static void karaoke_open_menu(struct App *app)
+{
+    s_folder_sp = 0;
+    s_ctx_folder = 0;
+    s_folder_title[0] = '\0';
+    s_sp = 0;
+    s_view = UI_VIEW_LIBRARY;
+    s_focus = 0;
+    s_scroll = 0;
+    s_overlay = 1;
+    s_idle_on = 0;
+    s_vol_open = 0;
+    s_vol_wheel = 0;
+    s_mouse_drag = 0;
+    ui_refresh_lists(app);
 }
 
 static int dir_name_cmp(const void *a, const void *b)
@@ -1466,14 +2056,49 @@ static void open_dir_browser(const char *start)
 void ui_refresh_lists(struct App *app)
 {
     char sub[160];
+    int song_keep_shuffle = 0;
+    int64_t song_keep_id = 0;
+    sync_karaoke(app);
+    if (s_view == UI_VIEW_SONGS && s_nrows > 0 && s_focus >= 0 && s_focus < s_nrows) {
+        if (s_rows[s_focus].kind == UI_KIND_TRACK) {
+            song_keep_id = s_rows[s_focus].id;
+        } else if (s_rows[s_focus].kind == UI_KIND_ACTION && s_rows[s_focus].id == 1 &&
+                   strcmp(s_rows[s_focus].line, "Shuffle All") == 0) {
+            song_keep_shuffle = 1;
+        }
+    }
     s_nrows = 0;
-    (void)app;
+    s_hover_row = -1;
+    s_ctx_on = 0;
     library_queue_cover_refresh();
     switch (s_view) {
     case UI_VIEW_LIBRARY: {
         LibTrack resume;
         int pos = 0;
         char rtitle[VIBE_NAME_MAX], rurl[VIBE_PATH_MAX], rsub[VIBE_NAME_MAX];
+        if (s_karaoke) {
+            add_row("Resume",
+                    karaoke_resume_song(&resume, &pos) == 0 ? resume.title : "Nothing to resume",
+                    1, UI_KIND_ACTION);
+            snprintf(sub, sizeof(sub), "%d songs", karaoke_song_fav_count());
+            add_row("Favorites", sub, 22, UI_KIND_ACTION);
+            snprintf(sub, sizeof(sub), "%d artists", karaoke_artist_count());
+            add_row("Artists", sub, 4, UI_KIND_ACTION);
+            snprintf(sub, sizeof(sub), "%d genres", karaoke_genre_count());
+            add_row("Genres", sub, 20, UI_KIND_ACTION);
+            snprintf(sub, sizeof(sub), "%d songs", karaoke_song_count());
+            add_row("Songs", sub, 12, UI_KIND_ACTION);
+            snprintf(sub, sizeof(sub), "%d folders", karaoke_folder_count());
+            add_row("Folders", sub, 5, UI_KIND_ACTION);
+            snprintf(sub, sizeof(sub), "%d songs", karaoke_queue_len());
+            add_row("Current Queue", sub, 8, UI_KIND_ACTION);
+            add_row("Search", "", 6, UI_KIND_ACTION);
+            add_row("Settings", "", 7, UI_KIND_ACTION);
+            add_row("Exit Karaoke Mode and Go Back to Regular Music Mode",
+                    "Leave karaoke and restore the music library", 21, UI_KIND_ACTION);
+            add_row("Exit", "Leave StOMP", 9, UI_KIND_ACTION);
+            break;
+        }
         if (library_resume_radio(rtitle, (int)sizeof(rtitle), rurl, (int)sizeof(rurl),
                                  rsub, (int)sizeof(rsub)) == 0 && rurl[0]) {
             add_row("Resume", rtitle[0] ? rtitle : "Internet Radio", 1, UI_KIND_ACTION);
@@ -1482,13 +2107,15 @@ void ui_refresh_lists(struct App *app)
                     library_resume_track(&resume, &pos) == 0 ? resume.title : "Nothing to resume",
                     1, UI_KIND_ACTION);
         }
+        add_row("Internet Radio", "Soma.fm, Radio Browser, Custom", 10, UI_KIND_ACTION);
         snprintf(sub, sizeof(sub), "%d artists", library_artist_count());
         add_row("Artists", sub, 4, UI_KIND_ACTION);
         snprintf(sub, sizeof(sub), "%d albums", library_album_count());
         add_row("Albums", sub, 3, UI_KIND_ACTION);
+        snprintf(sub, sizeof(sub), "%d tracks", library_track_count());
+        add_row("Songs", sub, 12, UI_KIND_ACTION);
         snprintf(sub, sizeof(sub), "%d folders", library_folder_count());
         add_row("Folders", sub, 5, UI_KIND_ACTION);
-        add_row("Internet Radio", "Soma.fm, Radio Browser, Custom", 10, UI_KIND_ACTION);
         snprintf(sub, sizeof(sub), "%d playlists", library_playlist_count());
         add_row("Playlists", sub, 11, UI_KIND_ACTION);
         snprintf(sub, sizeof(sub), "%d tracks", library_queue_len());
@@ -1511,9 +2138,19 @@ void ui_refresh_lists(struct App *app)
                 snprintf(sub, sizeof(sub), "%s  ·  %d tracks",
                          s_qbuf.albums[i].artist, s_qbuf.albums[i].track_count);
             }
-            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_album(s_qbuf.albums[i].id));
             add_row(s_qbuf.albums[i].name, sub, s_qbuf.albums[i].id, UI_KIND_ALBUM);
         }
+        break;
+    }
+    case UI_VIEW_SONGS: {
+        if (song_keep_id > 0 && !song_keep_shuffle) {
+            LibTrack t;
+            if (song_get(song_keep_id, &t) == 0) {
+                songs_show_at(t.title, t.id);
+                break;
+            }
+        }
+        songs_fill_start();
         break;
     }
     case UI_VIEW_ALBUM_FAVORITES: {
@@ -1521,7 +2158,6 @@ void ui_refresh_lists(struct App *app)
         for (int i = 0; i < n; i++) {
             snprintf(sub, sizeof(sub), "%s  ·  %d tracks",
                      s_qbuf.albums[i].artist, s_qbuf.albums[i].track_count);
-            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_album(s_qbuf.albums[i].id));
             add_row(s_qbuf.albums[i].name, sub, s_qbuf.albums[i].id, UI_KIND_ALBUM);
         }
         if (n == 0) {
@@ -1538,6 +2174,17 @@ void ui_refresh_lists(struct App *app)
     }
     case UI_VIEW_ARTISTS: {
         int n;
+        if (s_karaoke) {
+            n = karaoke_list_artists(s_qbuf.artists, VIBE_LIST_MAX);
+            for (int i = 0; i < n; i++) {
+                snprintf(sub, sizeof(sub), "%d songs", s_qbuf.artists[i].album_count);
+                add_row(s_qbuf.artists[i].name, sub, s_qbuf.artists[i].id, UI_KIND_ARTIST);
+            }
+            if (n == 0) {
+                add_row("No artists yet", "Set a karaoke folder in Settings", 0, UI_KIND_ACTION);
+            }
+            break;
+        }
         snprintf(sub, sizeof(sub), "%d artists", library_artist_fav_count());
         add_row("Favorites", sub, 1, UI_KIND_ACTION);
         n = library_list_artists(s_qbuf.artists, VIBE_LIST_MAX, 0);
@@ -1547,7 +2194,6 @@ void ui_refresh_lists(struct App *app)
             } else {
                 snprintf(sub, sizeof(sub), "%d albums", s_qbuf.artists[i].album_count);
             }
-            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_artist(s_qbuf.artists[i].id));
             add_row(s_qbuf.artists[i].name, sub, s_qbuf.artists[i].id, UI_KIND_ARTIST);
         }
         break;
@@ -1556,7 +2202,6 @@ void ui_refresh_lists(struct App *app)
         int n = library_artist_fav_list(s_qbuf.artists, VIBE_LIST_MAX);
         for (int i = 0; i < n; i++) {
             snprintf(sub, sizeof(sub), "%d albums", s_qbuf.artists[i].album_count);
-            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_artist(s_qbuf.artists[i].id));
             add_row(s_qbuf.artists[i].name, sub, s_qbuf.artists[i].id, UI_KIND_ARTIST);
         }
         if (n == 0) {
@@ -1565,32 +2210,87 @@ void ui_refresh_lists(struct App *app)
         break;
     }
     case UI_VIEW_ARTIST_ALBUMS: {
-        int n = library_artist_albums(s_ctx_artist, s_qbuf.albums, VIBE_LIST_MAX);
-        for (int i = 0; i < n; i++) {
+        int n, i;
+        if (s_karaoke) {
+            n = karaoke_artist_songs(s_ctx_artist, s_qbuf.tracks, VIBE_LIST_MAX);
+            for (i = 0; i < n; i++) {
+                add_track_row(s_qbuf.tracks[i].title, s_qbuf.tracks[i].album, s_qbuf.tracks[i].id);
+            }
+            if (n == 0) {
+                add_row("No songs", "", 0, UI_KIND_ACTION);
+            }
+            break;
+        }
+        n = library_artist_albums(s_ctx_artist, s_qbuf.albums, VIBE_LIST_MAX);
+        for (i = 0; i < n; i++) {
             if (library_album_fav_has(s_qbuf.albums[i].id)) {
                 snprintf(sub, sizeof(sub), "%d tracks  ·  Favorite", s_qbuf.albums[i].track_count);
             } else {
                 snprintf(sub, sizeof(sub), "%d tracks", s_qbuf.albums[i].track_count);
             }
-            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_album(s_qbuf.albums[i].id));
             add_row(s_qbuf.albums[i].name, sub, s_qbuf.albums[i].id, UI_KIND_ALBUM);
+        }
+        break;
+    }
+    case UI_VIEW_GENRES: {
+        int n = karaoke_list_genres(s_qbuf.artists, VIBE_LIST_MAX);
+        int i;
+        for (i = 0; i < n; i++) {
+            snprintf(sub, sizeof(sub), "%d songs", s_qbuf.artists[i].album_count);
+            add_row(s_qbuf.artists[i].name, sub, i + 1, UI_KIND_GENRE);
+        }
+        if (n == 0) {
+            add_row("No genres yet", "Set a karaoke folder in Settings", 0, UI_KIND_ACTION);
+        }
+        break;
+    }
+    case UI_VIEW_GENRE_SONGS: {
+        int n = karaoke_genre_songs(s_kara_genre, s_qbuf.tracks, VIBE_LIST_MAX);
+        int i;
+        for (i = 0; i < n; i++) {
+            add_track_row(s_qbuf.tracks[i].title, s_qbuf.tracks[i].artist, s_qbuf.tracks[i].id);
+        }
+        if (n == 0) {
+            add_row("No songs", "", 0, UI_KIND_ACTION);
+        }
+        break;
+    }
+    case UI_VIEW_SONG_FAVORITES: {
+        int n = karaoke_song_fav_list(s_qbuf.tracks, VIBE_LIST_MAX);
+        int i;
+        for (i = 0; i < n; i++) {
+            char line[128];
+            const char *artist = s_qbuf.tracks[i].artist[0] ? s_qbuf.tracks[i].artist : "Unknown Artist";
+            const char *title = s_qbuf.tracks[i].title[0] ? s_qbuf.tracks[i].title : "Unknown";
+            snprintf(line, sizeof(line), "%s - %s", artist, title);
+            add_track_row(line, s_qbuf.tracks[i].album, s_qbuf.tracks[i].id);
+        }
+        if (n == 0) {
+            add_row("No favorites yet", "Hold A on a song to save it", 0, UI_KIND_ACTION);
         }
         break;
     }
     case UI_VIEW_FOLDER_TRACKS:
     case UI_VIEW_FOLDERS: {
         int n, i;
-        n = library_list_folders(s_ctx_folder, s_qbuf.folders, VIBE_LIST_MAX);
+        if (s_karaoke) {
+            n = karaoke_list_folders(s_ctx_folder, s_qbuf.folders, VIBE_LIST_MAX);
+        } else {
+            n = library_list_folders(s_ctx_folder, s_qbuf.folders, VIBE_LIST_MAX);
+        }
         for (i = 0; i < n; i++) {
             if (s_qbuf.folders[i].child_count > 0) {
                 snprintf(sub, sizeof(sub), "%d tracks", s_qbuf.folders[i].child_count);
             } else {
                 snprintf(sub, sizeof(sub), "Folder");
             }
-            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_folder(s_qbuf.folders[i].id));
             add_row(s_qbuf.folders[i].name, sub, s_qbuf.folders[i].id, UI_KIND_FOLDER);
         }
-        n = library_folder_direct_tracks(s_ctx_folder, s_qbuf.tracks, VIBE_LIST_MAX);
+        if (s_karaoke) {
+            n = karaoke_folder_direct_tracks(s_ctx_folder, s_qbuf.tracks, VIBE_LIST_MAX);
+        } else {
+            n = library_folder_direct_tracks(s_ctx_folder, s_qbuf.tracks, VIBE_LIST_MAX);
+        }
         for (i = 0; i < n; i++) {
             add_track_row(s_qbuf.tracks[i].title, s_qbuf.tracks[i].artist, s_qbuf.tracks[i].id);
         }
@@ -1607,7 +2307,6 @@ void ui_refresh_lists(struct App *app)
             } else {
                 snprintf(sub, sizeof(sub), "%d tracks", s_qbuf.playlists[i].item_count);
             }
-            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_playlist(s_qbuf.playlists[i].id));
             add_row(s_qbuf.playlists[i].name, sub, s_qbuf.playlists[i].id, UI_KIND_PLAYLIST);
         }
         if (n == 0) {
@@ -1619,7 +2318,6 @@ void ui_refresh_lists(struct App *app)
         int n = library_playlist_fav_list(s_qbuf.playlists, VIBE_LIST_MAX);
         for (int i = 0; i < n; i++) {
             snprintf(sub, sizeof(sub), "%d tracks", s_qbuf.playlists[i].item_count);
-            fmt_queue_cover(sub, sizeof(sub), sub, library_queue_cover_playlist(s_qbuf.playlists[i].id));
             add_row(s_qbuf.playlists[i].name, sub, s_qbuf.playlists[i].id, UI_KIND_PLAYLIST);
         }
         if (n == 0) {
@@ -1638,24 +2336,38 @@ void ui_refresh_lists(struct App *app)
         break;
     }
     case UI_VIEW_QUEUE: {
-        int n = library_queue_len();
-        add_row("Queue Options", "Clear, save as playlist", 1, UI_KIND_ACTION);
+        int n = s_karaoke ? karaoke_queue_len() : library_queue_len();
+        int qi = s_karaoke ? karaoke_queue_index() : library_queue_index();
+        if (s_karaoke) {
+            add_row("Queue Options", "Clear the set list", 1, UI_KIND_ACTION);
+        } else {
+            add_row("Queue Options", "Clear, save as playlist", 1, UI_KIND_ACTION);
+        }
         if (n == 0) {
-            add_row("Queue is empty", "Hold Y on a song, album, artist, or folder to add it", 0, UI_KIND_ACTION);
+            add_row("Queue is empty", "Hold Y on a song, artist, genre, or folder to add it", 0, UI_KIND_ACTION);
+        }
+        if (n > VIBE_UI_ROWS_MAX - 2) {
+            n = VIBE_UI_ROWS_MAX - 2;
         }
         for (int i = 0; i < n; i++) {
             LibTrack t;
-            if (library_queue_get(i, &t) != 0) {
+            if (s_karaoke) {
+                if (karaoke_queue_get(i, &t) != 0) {
+                    continue;
+                }
+            } else if (library_queue_get(i, &t) != 0) {
                 continue;
             }
-            snprintf(sub, sizeof(sub), "%s%s", t.artist, i == library_queue_index() ? "  ·  now" : "");
+            snprintf(sub, sizeof(sub), "%s%s", t.artist, i == qi ? "  ·  now" : "");
             add_row(t.title, sub, t.id, UI_KIND_TRACK);
         }
         break;
     }
     case UI_VIEW_QUEUE_OPTIONS:
         add_row("Clear Queue", "Remove every song and stop playback", 1, UI_KIND_ACTION);
-        add_row("Save Queue to Playlist", "Write an .m3u in your music folder", 2, UI_KIND_ACTION);
+        if (!s_karaoke) {
+            add_row("Save Queue to Playlist", "Write an .m3u in your music folder", 2, UI_KIND_ACTION);
+        }
         break;
     case UI_VIEW_QUEUE_SAVE:
         s_show_kb = 1;
@@ -1663,10 +2375,15 @@ void ui_refresh_lists(struct App *app)
     case UI_VIEW_SEARCH: {
         int n = 0;
         if (s_search[0]) {
-            n = library_search(s_search, s_qbuf.tracks, 200);
+            n = s_karaoke ? karaoke_search(s_search, s_qbuf.tracks, 200)
+                          : library_search(s_search, s_qbuf.tracks, 200);
         }
         for (int i = 0; i < n; i++) {
-            snprintf(sub, sizeof(sub), "%s  ·  %s", s_qbuf.tracks[i].artist, s_qbuf.tracks[i].album);
+            if (s_karaoke) {
+                snprintf(sub, sizeof(sub), "%s  ·  %s", s_qbuf.tracks[i].artist, s_qbuf.tracks[i].album);
+            } else {
+                snprintf(sub, sizeof(sub), "%s  ·  %s", s_qbuf.tracks[i].artist, s_qbuf.tracks[i].album);
+            }
             add_track_row(s_qbuf.tracks[i].title, sub, s_qbuf.tracks[i].id);
         }
         s_show_kb = 1;
@@ -1675,13 +2392,34 @@ void ui_refresh_lists(struct App *app)
     case UI_VIEW_SETTINGS: {
         music_folder_sub(app, sub, sizeof(sub));
         add_row("Music folder", sub, 8, UI_KIND_SETTING);
-        add_row("Rescan library", "Walk selected folders", 1, UI_KIND_SETTING);
+        add_row("Karaoke Mode",
+                app && app->cfg.karaoke_mode ? "On  ·  karaoke library" : "Off  ·  music library",
+                13, UI_KIND_SETTING);
+        if (app && app->cfg.karaoke_dir_count <= 0) {
+            snprintf(sub, sizeof(sub), "Not set");
+        } else if (app && app->cfg.karaoke_dir_count == 1) {
+            snprintf(sub, sizeof(sub), "%s", app->cfg.karaoke_dirs[0]);
+        } else if (app) {
+            snprintf(sub, sizeof(sub), "%d folders", app->cfg.karaoke_dir_count);
+        } else {
+            snprintf(sub, sizeof(sub), "Not set");
+        }
+        add_row("Karaoke folder", sub, 14, UI_KIND_SETTING);
+        add_row("Rescan library", s_karaoke ? "Walk karaoke folders" : "Walk selected folders", 1, UI_KIND_SETTING);
         snprintf(sub, sizeof(sub), "%s", app->cfg.audio_device[0] ? app->cfg.audio_device : "Default");
         add_row("Audio device", sub, 2, UI_KIND_SETTING);
         add_row("Preset shuffle", viz_shuffle() ? "On" : "Off", 4, UI_KIND_SETTING);
         add_row("Visualization lock", viz_locked() ? "Locked" : "Unlocked", 5, UI_KIND_SETTING);
         add_row("Visualization pool", viz_pool_label(viz_pool()), 9, UI_KIND_SETTING);
         add_row("Start view", app->cfg.start_library ? "Library" : "Now playing", 6, UI_KIND_SETTING);
+        add_row("Auto-hide",
+                app->cfg.np_keep_info
+                    ? "Always show controls and track information"
+                    : "Hide controls and track information when idle",
+                11, UI_KIND_SETTING);
+        add_row("VSync",
+                app->cfg.vsync ? "On  ·  no screen tearing" : "Off  ·  may tear",
+                12, UI_KIND_SETTING);
         add_row("Controller layout", "Customize or reset", 10, UI_KIND_SETTING);
         break;
     }
@@ -1698,15 +2436,21 @@ void ui_refresh_lists(struct App *app)
         break;
     }
     case UI_VIEW_MUSIC_DIRS: {
-        int i;
+        int i, n;
+        const char (*dirs)[VIBE_PATH_MAX];
         add_row("Add folder", "Browse the filesystem", 1, UI_KIND_ACTION);
-        if (!app || app->cfg.music_dir_count == 0) {
-            add_row("No music folder yet", "A on Add folder", 0, UI_KIND_ACTION);
+        n = s_dir_karaoke ? (app ? app->cfg.karaoke_dir_count : 0)
+                          : (app ? app->cfg.music_dir_count : 0);
+        dirs = s_dir_karaoke ? (app ? app->cfg.karaoke_dirs : NULL)
+                             : (app ? app->cfg.music_dirs : NULL);
+        if (n == 0) {
+            add_row(s_dir_karaoke ? "No karaoke folder yet" : "No music folder yet",
+                    "A on Add folder", 0, UI_KIND_ACTION);
         }
-        for (i = 0; app && i < app->cfg.music_dir_count; i++) {
+        for (i = 0; dirs && i < n; i++) {
             char name[VIBE_NAME_MAX];
-            path_basename(app->cfg.music_dirs[i], name, sizeof(name));
-            snprintf(sub, sizeof(sub), "Y  remove  ·  %s", app->cfg.music_dirs[i]);
+            path_basename(dirs[i], name, sizeof(name));
+            snprintf(sub, sizeof(sub), "Y  remove  ·  %s", dirs[i]);
             add_row(name, sub, 100 + i, UI_KIND_ACTION);
         }
         break;
@@ -2027,6 +2771,35 @@ static void flush_font(void)
     flush(1, s_atlas);
 }
 
+static void draw_native_cp(float x, float y, uint32_t cp, float scale,
+                           float r, float g, float b, float a)
+{
+    float want = s_size_px * scale * s_scale;
+    int px = (int)(want + 0.5f);
+    float k;
+    if (px < 8) {
+        px = 8;
+    }
+    if (px > 256) {
+        px = 256;
+    }
+    k = want / (float)px;
+    if (ensure_jumbo(cp, px) == 0 && s_jumbo_tex && s_jumbo_bw >= 1.f) {
+        flush_color();
+        quad(x + s_jumbo_ax * k, y - s_jumbo_ay * k,
+             s_jumbo_bw * k, s_jumbo_bh * k,
+             0.f, 0.f, 1.f, 1.f, r, g, b, a);
+        flush(1, s_jumbo_tex);
+        return;
+    }
+    {
+        char t[8];
+        utf8_put(t, sizeof(t), cp);
+        draw_text(x, y, t, scale, r, g, b, a);
+        flush_font();
+    }
+}
+
 static void fmt_time(char *buf, size_t n, double sec)
 {
     int s, m;
@@ -2123,12 +2896,11 @@ static void icon_stop(float x, float y, float s)
     draw_rect(x + (s - inner) * 0.5f, y + (s - inner) * 0.5f, inner, inner, ir, ig, ib, 1.f);
 }
 
-static void icon_speaker_wave(float cx, float cy, float r)
+static void icon_speaker_wave(float cx, float cy, float r, float thick)
 {
     float ir = 0.92f, ig = 0.92f, ib = 0.92f;
-    float a0 = -0.60f, a1 = 0.60f;
-    float t = 4.5f * s_scale;
-    const int N = 4;
+    float a0 = -0.95f, a1 = 0.95f;
+    const int N = 7;
     for (int i = 0; i < N; i++) {
         float pa = a0 + (a1 - a0) * (float)i / (float)N;
         float pb = a0 + (a1 - a0) * (float)(i + 1) / (float)N;
@@ -2136,8 +2908,8 @@ static void icon_speaker_wave(float cx, float cy, float r)
         float c1 = cosf(pb), s1 = sinf(pb);
         float x0 = cx + r * c0, y0 = cy + r * s0;
         float x1 = cx + r * c1, y1 = cy + r * s1;
-        float x2 = cx + (r + t) * c1, y2 = cy + (r + t) * s1;
-        float x3 = cx + (r + t) * c0, y3 = cy + (r + t) * s0;
+        float x2 = cx + (r + thick) * c1, y2 = cy + (r + thick) * s1;
+        float x3 = cx + (r + thick) * c0, y3 = cy + (r + thick) * s0;
         draw_tri(x0, y0, x1, y1, x2, y2, ir, ig, ib, 1.f);
         draw_tri(x0, y0, x2, y2, x3, y3, ir, ig, ib, 1.f);
     }
@@ -2145,62 +2917,651 @@ static void icon_speaker_wave(float cx, float cy, float r)
 
 static void icon_speaker(float x, float y, float s)
 {
-    float p = 9.f * s_scale;
+    if (s_speaker_tex) {
+        blit_hud(s_speaker_tex, x, y, s);
+        return;
+    }
+    {
     float ir = 0.92f, ig = 0.92f, ib = 0.92f;
     float mid = y + s * 0.5f;
-    float top = mid - s * 0.26f;
-    float bot = mid + s * 0.26f;
-    float bx = x + p;
-    float bw = s * 0.24f;
-    float txt = bx + bw;
-    float tip = txt + s * 0.10f;
-    draw_rect(bx, top, bw, bot - top, ir, ig, ib, 1.f);
-    draw_tri(txt, mid, tip, top, tip, bot, ir, ig, ib, 1.f);
-    float cx = tip + s * 0.02f;
-    icon_speaker_wave(cx, mid, s * 0.13f);
-    icon_speaker_wave(cx, mid, s * 0.22f);
+    float dw = s * 0.16f;
+    float dh = s * 0.30f;
+    float dx = x + s * 0.12f;
+    float hx0 = dx + dw;
+    float hx1 = x + s * 0.50f;
+    float nh = dh * 0.5f;
+    float wh = s * 0.34f;
+    float thick = 3.2f * s_scale;
+    draw_rect(dx, mid - nh, dw, dh, ir, ig, ib, 1.f);
+    draw_tri(hx0, mid - nh, hx1, mid - wh, hx1, mid + wh, ir, ig, ib, 1.f);
+    draw_tri(hx0, mid - nh, hx1, mid + wh, hx0, mid + nh, ir, ig, ib, 1.f);
+    icon_speaker_wave(hx1, mid, s * 0.16f, thick);
+    icon_speaker_wave(hx1, mid, s * 0.28f, thick);
+    }
+}
+
+static void fill_ellipse(float cx, float cy, float rx, float ry,
+                         float r, float g, float b, float a, int n)
+{
+    const float twopi = 6.2831853f;
+    int i;
+    if (n < 8) {
+        n = 8;
+    }
+    for (i = 0; i < n; i++) {
+        float a0 = twopi * (float)i / (float)n;
+        float a1 = twopi * (float)(i + 1) / (float)n;
+        draw_tri(cx, cy,
+                 cx + rx * cosf(a0), cy + ry * sinf(a0),
+                 cx + rx * cosf(a1), cy + ry * sinf(a1),
+                 r, g, b, a);
+    }
 }
 
 static void icon_eye(float x, float y, float s, int on)
 {
+    unsigned tex = s_eye_tex[on ? 1 : 0];
+    if (tex) {
+        blit_hud(tex, x, y, s);
+        return;
+    }
+    {
     float ir = 0.92f, ig = 0.92f, ib = 0.92f;
     float cx = x + s * 0.5f;
     float cy = y + s * 0.5f;
-    float w = s * 0.38f;
-    float h = s * 0.18f;
+    float w = s * 0.36f;
+    float h = s * 0.20f;
     if (on) {
-        float pr = s * 0.10f;
-        draw_tri(cx - w, cy, cx, cy - h, cx + w, cy, ir, ig, ib, 1.f);
-        draw_tri(cx - w, cy, cx + w, cy, cx, cy + h, ir, ig, ib, 1.f);
-        draw_rect(cx - pr * 0.5f, cy - pr * 0.5f, pr, pr, 0.08f, 0.10f, 0.16f, 1.f);
+        fill_ellipse(cx, cy, w, h, ir, ig, ib, 1.f, 20);
     } else {
         float lh = 3.f * s_scale;
         draw_rect(cx - w, cy - lh * 0.5f, w * 2.f, lh, ir, ig, ib, 1.f);
     }
+    }
 }
 
-static void draw_now_playing(struct App *app)
+static void draw_line_th(float x0, float y0, float x1, float y1, float t,
+                         float r, float g, float b, float a)
 {
-    float strip_h = 228.f * s_scale;
-    float y = (float)s_win_h - strip_h;
-    float bar_x = 80.f * s_scale;
-    float bar_w = (float)s_win_w - 160.f * s_scale;
-    float opt_y, bar_y;
-    double dur = decode_duration();
-    double pos = decode_position();
-    float t = (dur > 0.1) ? (float)(pos / dur) : 0.f;
-    char a[32], b[32];
-    LibTrack next;
-    int qn = library_queue_len();
-    int qi = library_queue_index();
+    float dx = x1 - x0, dy = y1 - y0;
+    float len = sqrtf(dx * dx + dy * dy);
+    float nx, ny;
+    if (len < 0.001f) {
+        return;
+    }
+    nx = -dy / len * t * 0.5f;
+    ny = dx / len * t * 0.5f;
+    draw_tri(x0 + nx, y0 + ny, x1 + nx, y1 + ny, x1 - nx, y1 - ny, r, g, b, a);
+    draw_tri(x0 + nx, y0 + ny, x1 - nx, y1 - ny, x0 - nx, y0 - ny, r, g, b, a);
+}
 
+static void draw_arrow_head(float x, float y, float dx, float dy, float size,
+                            float r, float g, float b, float a)
+{
+    float len = sqrtf(dx * dx + dy * dy);
+    float ux, uy, px, py;
+    if (len < 0.001f) {
+        return;
+    }
+    ux = dx / len;
+    uy = dy / len;
+    px = -uy;
+    py = ux;
+    draw_tri(x + ux * size, y + uy * size,
+             x - ux * size * 0.25f + px * size * 0.72f,
+             y - uy * size * 0.25f + py * size * 0.72f,
+             x - ux * size * 0.25f - px * size * 0.72f,
+             y - uy * size * 0.25f - py * size * 0.72f,
+             r, g, b, a);
+}
+
+static void stroke_arc(float cx, float cy, float r, float thick, float a0, float a1, int n,
+                       float cr, float cg, float cb, float ca)
+{
+    int i;
+    if (n < 4) {
+        n = 4;
+    }
+    for (i = 0; i < n; i++) {
+        float pa = a0 + (a1 - a0) * (float)i / (float)n;
+        float pb = a0 + (a1 - a0) * (float)(i + 1) / (float)n;
+        float c0 = cosf(pa), s0 = sinf(pa);
+        float c1 = cosf(pb), s1 = sinf(pb);
+        float x0 = cx + r * c0, y0 = cy + r * s0;
+        float x1 = cx + r * c1, y1 = cy + r * s1;
+        float x2 = cx + (r + thick) * c1, y2 = cy + (r + thick) * s1;
+        float x3 = cx + (r + thick) * c0, y3 = cy + (r + thick) * s0;
+        draw_tri(x0, y0, x1, y1, x2, y2, cr, cg, cb, ca);
+        draw_tri(x0, y0, x2, y2, x3, y3, cr, cg, cb, ca);
+    }
+}
+
+static void icon_shuffle(float x, float y, float s, int on)
+{
+    unsigned tex = s_shuf_tex[on ? 1 : 0];
+    if (tex) {
+        blit_hud(tex, x, y, s);
+        return;
+    }
+    {
+    float a = on ? 1.f : 0.38f;
+    float ir = 0.92f, ig = 0.92f, ib = 0.92f;
+    float t = 3.2f * s_scale;
+    float ah = s * 0.13f;
+    float x0 = x + s * 0.16f;
+    float x1 = x + s * 0.40f;
+    float x2 = x + s * 0.60f;
+    float x3 = x + s * 0.78f;
+    float yt = y + s * 0.30f;
+    float yb = y + s * 0.70f;
+    draw_line_th(x0, yt, x1, yt, t, ir, ig, ib, a);
+    draw_line_th(x1, yt, x2, yb, t, ir, ig, ib, a);
+    draw_line_th(x2, yb, x3, yb, t, ir, ig, ib, a);
+    draw_arrow_head(x3, yb, 1.f, 0.f, ah, ir, ig, ib, a);
+    draw_line_th(x0, yb, x1, yb, t, ir, ig, ib, a);
+    draw_line_th(x1, yb, x2, yt, t, ir, ig, ib, a);
+    draw_line_th(x2, yt, x3, yt, t, ir, ig, ib, a);
+    draw_arrow_head(x3, yt, 1.f, 0.f, ah, ir, ig, ib, a);
+    }
+}
+
+static void icon_repeat(float x, float y, float s, int mode)
+{
+    unsigned tex = 0;
+    if (mode < 0) {
+        mode = 0;
+    }
+    if (mode > 2) {
+        mode = 2;
+    }
+    tex = s_rep_tex[mode];
+    if (tex) {
+        blit_hud(tex, x, y, s);
+        return;
+    }
+    {
+    float a = (mode == VIBE_REPEAT_OFF) ? 0.38f : 1.f;
+    float ir = 0.92f, ig = 0.92f, ib = 0.92f;
+    float cx = x + s * 0.5f;
+    float cy = y + s * 0.5f;
+    float r = s * 0.22f;
+    float thick = 3.2f * s_scale;
+    float ah = s * 0.13f;
+    const float pi = 3.14159265f;
+    float rm = r + thick * 0.5f;
+    stroke_arc(cx, cy, r, thick, -pi * 0.5f + 0.55f, pi * 0.5f - 0.55f, 10, ir, ig, ib, a);
+    stroke_arc(cx, cy, r, thick, pi * 0.5f + 0.55f, pi * 1.5f - 0.55f, 10, ir, ig, ib, a);
+    draw_arrow_head(cx, cy - rm, 1.f, 0.f, ah, ir, ig, ib, a);
+    draw_arrow_head(cx, cy + rm, -1.f, 0.f, ah, ir, ig, ib, a);
+    if (mode == VIBE_REPEAT_ONE) {
+        float tw = 2.6f * s_scale;
+        float th = s * 0.22f;
+        draw_rect(cx - tw * 0.15f, cy - th * 0.5f, tw, th, ir, ig, ib, a);
+        draw_rect(cx - tw * 0.85f, cy - th * 0.5f, tw * 0.7f, tw, ir, ig, ib, a);
+    }
+    }
+}
+
+static int lock_hit_rect(float px, float py, float x, float y, float w, float h)
+{
+    return px >= x && px <= x + w && py >= y && py <= y + h;
+}
+
+static int lock_hit_circle(float px, float py, float cx, float cy, float r)
+{
+    float dx = px - cx, dy = py - cy;
+    return dx * dx + dy * dy <= r * r;
+}
+
+static int hud_hit_ellipse(float px, float py, float cx, float cy, float rx, float ry)
+{
+    float dx, dy;
+    if (rx < 1e-6f || ry < 1e-6f) {
+        return 0;
+    }
+    dx = (px - cx) / rx;
+    dy = (py - cy) / ry;
+    return dx * dx + dy * dy <= 1.f;
+}
+
+static int hud_hit_tri(float px, float py,
+                       float x0, float y0, float x1, float y1, float x2, float y2)
+{
+    float d0 = (px - x1) * (y0 - y1) - (x0 - x1) * (py - y1);
+    float d1 = (px - x2) * (y1 - y2) - (x1 - x2) * (py - y2);
+    float d2 = (px - x0) * (y2 - y0) - (x2 - x0) * (py - y0);
+    return (d0 >= 0.f && d1 >= 0.f && d2 >= 0.f) || (d0 <= 0.f && d1 <= 0.f && d2 <= 0.f);
+}
+
+static float hud_dist_seg(float px, float py, float x0, float y0, float x1, float y1)
+{
+    float dx = x1 - x0, dy = y1 - y0;
+    float l2 = dx * dx + dy * dy;
+    float t, sx, sy;
+    if (l2 < 1e-12f) {
+        sx = px - x0;
+        sy = py - y0;
+        return sqrtf(sx * sx + sy * sy);
+    }
+    t = ((px - x0) * dx + (py - y0) * dy) / l2;
     if (t < 0.f) {
         t = 0.f;
     }
     if (t > 1.f) {
         t = 1.f;
     }
-    draw_rect(0, y, (float)s_win_w, strip_h, 0.f, 0.f, 0.f, s_veil);
+    sx = px - (x0 + t * dx);
+    sy = py - (y0 + t * dy);
+    return sqrtf(sx * sx + sy * sy);
+}
+
+static int hud_hit_arrow(float px, float py, float x, float y, float dx, float dy, float size)
+{
+    float len = sqrtf(dx * dx + dy * dy);
+    float ux, uy, pxn, pyn;
+    if (len < 0.001f) {
+        return 0;
+    }
+    ux = dx / len;
+    uy = dy / len;
+    pxn = -uy;
+    pyn = ux;
+    return hud_hit_tri(px, py,
+                       x + ux * size, y + uy * size,
+                       x - ux * size * 0.25f + pxn * size * 0.72f,
+                       y - uy * size * 0.25f + pyn * size * 0.72f,
+                       x - ux * size * 0.25f - pxn * size * 0.72f,
+                       y - uy * size * 0.25f - pyn * size * 0.72f);
+}
+
+static int hud_hit_wave(float px, float py, float cx, float cy, float r, float thick)
+{
+    float dx = px - cx, dy = py - cy;
+    float d = sqrtf(dx * dx + dy * dy);
+    float ang;
+    if (d < r || d > r + thick) {
+        return 0;
+    }
+    ang = atan2f(dy, dx);
+    return ang >= -0.95f && ang <= 0.95f;
+}
+
+static void hud_metal(int hit, float alpha, float *r, float *g, float *b, float *a)
+{
+    if (!hit || alpha <= 0.f) {
+        *r = *g = *b = *a = 0.f;
+        return;
+    }
+    *r = 0.92f;
+    *g = 0.92f;
+    *b = 0.92f;
+    *a = alpha;
+}
+
+static void lock_sample(float px, float py, int locked, float *r, float *g, float *b, float *a)
+{
+    const float cx = 0.56f;
+    const float bw = 0.46f;
+    const float bh = 0.34f;
+    const float bx = cx - bw * 0.5f;
+    const float by = 0.416f;
+    const float t = 3.4f / 36.f;
+    const float span = bw * 0.54f;
+    const float lx = cx - span * 0.5f;
+    const float rx = cx + span * 0.5f;
+    float hx = lx;
+    float fx = locked ? rx : (lx - span);
+    float acx = (hx + fx) * 0.5f;
+    float ar = fabsf(fx - hx) * 0.5f - t * 0.5f;
+    const float leg = 0.11f;
+    const float kr = 0.055f;
+    const float ky = by + bh * 0.38f;
+    int in_body, in_hole, in_shackle;
+    float dx, dy, d;
+
+    if (ar < t) {
+        ar = t;
+    }
+    in_body = lock_hit_rect(px, py, bx, by, bw, bh);
+    in_hole = in_body && (lock_hit_circle(px, py, cx, ky, kr) ||
+                          lock_hit_rect(px, py, cx - kr * 0.42f, ky, kr * 0.84f, bh * 0.30f));
+    dx = px - acx;
+    dy = py - by;
+    d = sqrtf(dx * dx + dy * dy);
+    in_shackle = (d >= ar && d <= ar + t && py <= by + 0.0008f) ||
+                 lock_hit_rect(px, py, hx - t * 0.5f, by, t, leg) ||
+                 lock_hit_rect(px, py, fx - t * 0.5f, by, t, leg);
+    if ((in_body && !in_hole) || in_shackle) {
+        *r = 0.92f;
+        *g = 0.92f;
+        *b = 0.92f;
+        *a = 1.f;
+        return;
+    }
+    *r = *g = *b = *a = 0.f;
+}
+
+static void speaker_sample(float px, float py, int var, float *r, float *g, float *b, float *a)
+{
+    const float mid = 0.5f;
+    const float dw = 0.16f;
+    const float dh = 0.30f;
+    const float dx = 0.12f;
+    const float hx0 = dx + dw;
+    const float hx1 = 0.50f;
+    const float nh = dh * 0.5f;
+    const float wh = 0.34f;
+    const float thick = 3.2f / 36.f;
+    int hit;
+    (void)var;
+    hit = lock_hit_rect(px, py, dx, mid - nh, dw, dh) ||
+          hud_hit_tri(px, py, hx0, mid - nh, hx1, mid - wh, hx1, mid + wh) ||
+          hud_hit_tri(px, py, hx0, mid - nh, hx1, mid + wh, hx0, mid + nh) ||
+          hud_hit_wave(px, py, hx1, mid, 0.16f, thick) ||
+          hud_hit_wave(px, py, hx1, mid, 0.28f, thick);
+    hud_metal(hit, 1.f, r, g, b, a);
+}
+
+static void eye_sample(float px, float py, int on, float *r, float *g, float *b, float *a)
+{
+    const float cx = 0.5f, cy = 0.5f;
+    const float w = 0.36f, h = 0.20f;
+    if (on) {
+        int in_eye = hud_hit_ellipse(px, py, cx, cy, w, h);
+        int in_pupil = hud_hit_ellipse(px, py, cx, cy, 0.09f, 0.09f);
+        hud_metal(in_eye && !in_pupil, 1.f, r, g, b, a);
+        return;
+    }
+    {
+        const float lh = 3.f / 36.f;
+        hud_metal(lock_hit_rect(px, py, cx - w, cy - lh * 0.5f, w * 2.f, lh), 1.f, r, g, b, a);
+    }
+}
+
+static void live_dot_sample(float px, float py, int var, float *r, float *g, float *b, float *a)
+{
+    float dx = px - 0.5f, dy = py - 0.5f;
+    float d = sqrtf(dx * dx + dy * dy);
+    const float rad = 0.38f;
+    const float edge = 0.045f;
+    float cov;
+    (void)var;
+    if (d <= rad) {
+        cov = 1.f;
+    } else if (d < rad + edge) {
+        cov = 1.f - (d - rad) / edge;
+    } else {
+        cov = 0.f;
+    }
+    *r = 0.92f;
+    *g = 0.14f;
+    *b = 0.16f;
+    *a = cov;
+}
+
+static void shuf_sample(float px, float py, int on, float *r, float *g, float *b, float *a)
+{
+    const float t = 3.2f / 36.f;
+    const float half = t * 0.5f;
+    const float ah = 0.13f;
+    const float x0 = 0.16f, x1 = 0.40f, x2 = 0.60f, x3 = 0.78f;
+    const float yt = 0.30f, yb = 0.70f;
+    float alpha = on ? 1.f : 0.38f;
+    int hit;
+    hit = hud_dist_seg(px, py, x0, yt, x1, yt) <= half ||
+          hud_dist_seg(px, py, x1, yt, x2, yb) <= half ||
+          hud_dist_seg(px, py, x2, yb, x3, yb) <= half ||
+          hud_hit_arrow(px, py, x3, yb, 1.f, 0.f, ah) ||
+          hud_dist_seg(px, py, x0, yb, x1, yb) <= half ||
+          hud_dist_seg(px, py, x1, yb, x2, yt) <= half ||
+          hud_dist_seg(px, py, x2, yt, x3, yt) <= half ||
+          hud_hit_arrow(px, py, x3, yt, 1.f, 0.f, ah);
+    hud_metal(hit, alpha, r, g, b, a);
+}
+
+static void rep_sample(float px, float py, int mode, float *r, float *g, float *b, float *a)
+{
+    const float cx = 0.5f, cy = 0.5f;
+    const float rad = 0.22f;
+    const float thick = 3.2f / 36.f;
+    const float ah = 0.13f;
+    const float pi = 3.14159265f;
+    const float rm = rad + thick * 0.5f;
+    float alpha = (mode == 0) ? 0.38f : 1.f;
+    float dx = px - cx, dy = py - cy;
+    float d = sqrtf(dx * dx + dy * dy);
+    float ang = atan2f(dy, dx);
+    int hit = 0;
+    if (d >= rad && d <= rad + thick) {
+        float a0 = -pi * 0.5f + 0.55f;
+        float a1 = pi * 0.5f - 0.55f;
+        float b0 = pi * 0.5f + 0.55f;
+        float b1 = pi * 1.5f - 0.55f;
+        if (ang >= a0 && ang <= a1) {
+            hit = 1;
+        }
+        if (ang < 0.f) {
+            ang += pi * 2.f;
+        }
+        if (ang >= b0 && ang <= b1) {
+            hit = 1;
+        }
+    }
+    hit = hit || hud_hit_arrow(px, py, cx, cy - rm, 1.f, 0.f, ah) ||
+          hud_hit_arrow(px, py, cx, cy + rm, -1.f, 0.f, ah);
+    if (mode == 2) {
+        const float tw = 2.6f / 36.f;
+        const float th = 0.22f;
+        hit = hit || lock_hit_rect(px, py, cx - tw * 0.15f, cy - th * 0.5f, tw, th) ||
+              lock_hit_rect(px, py, cx - tw * 0.85f, cy - th * 0.5f, tw * 0.7f, tw);
+    }
+    hud_metal(hit, alpha, r, g, b, a);
+}
+
+static unsigned make_hud_tex(void (*sample)(float, float, int, float *, float *, float *, float *), int var)
+{
+    enum { N = 128, SS = 4 };
+    unsigned char *px;
+    unsigned tex = 0;
+    int y, x, sy, sx;
+    const float nss = (float)(SS * SS);
+
+    px = (unsigned char *)calloc((size_t)N * (size_t)N * 4u, 1);
+    if (!px) {
+        return 0;
+    }
+    for (y = 0; y < N; y++) {
+        for (x = 0; x < N; x++) {
+            float pr = 0.f, pg = 0.f, pb = 0.f, pa = 0.f;
+            for (sy = 0; sy < SS; sy++) {
+                for (sx = 0; sx < SS; sx++) {
+                    float u = ((float)x + ((float)sx + 0.5f) / (float)SS) / (float)N;
+                    float v = ((float)y + ((float)sy + 0.5f) / (float)SS) / (float)N;
+                    float r, g, b, a;
+                    sample(u, v, var, &r, &g, &b, &a);
+                    pr += r * a;
+                    pg += g * a;
+                    pb += b * a;
+                    pa += a;
+                }
+            }
+            pr /= nss;
+            pg /= nss;
+            pb /= nss;
+            pa /= nss;
+            {
+                unsigned char *p = px + ((size_t)y * (size_t)N + (size_t)x) * 4u;
+                if (pa > 0.0001f) {
+                    p[0] = (unsigned char)(pr / pa * 255.f + 0.5f);
+                    p[1] = (unsigned char)(pg / pa * 255.f + 0.5f);
+                    p[2] = (unsigned char)(pb / pa * 255.f + 0.5f);
+                    p[3] = (unsigned char)(pa * 255.f + 0.5f);
+                }
+            }
+        }
+    }
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, N, N, 0, GL_RGBA, GL_UNSIGNED_BYTE, px);
+    free(px);
+    return tex;
+}
+
+static void hud_del_tex(unsigned *t)
+{
+    if (t && *t) {
+        glDeleteTextures(1, t);
+        *t = 0;
+    }
+}
+
+static void blit_hud(unsigned tex, float x, float y, float s)
+{
+    flush_color();
+    quad(x, y, s, s, 0.f, 0.f, 1.f, 1.f, 1.f, 1.f, 1.f, 1.f);
+    flush(1, tex);
+}
+
+static void load_hud_icons(void)
+{
+    hud_del_tex(&s_lock_tex[0]);
+    hud_del_tex(&s_lock_tex[1]);
+    hud_del_tex(&s_speaker_tex);
+    hud_del_tex(&s_eye_tex[0]);
+    hud_del_tex(&s_eye_tex[1]);
+    hud_del_tex(&s_shuf_tex[0]);
+    hud_del_tex(&s_shuf_tex[1]);
+    hud_del_tex(&s_rep_tex[0]);
+    hud_del_tex(&s_rep_tex[1]);
+    hud_del_tex(&s_rep_tex[2]);
+    hud_del_tex(&s_live_dot_tex);
+    s_lock_tex[0] = make_hud_tex(lock_sample, 0);
+    s_lock_tex[1] = make_hud_tex(lock_sample, 1);
+    s_speaker_tex = make_hud_tex(speaker_sample, 0);
+    s_eye_tex[0] = make_hud_tex(eye_sample, 0);
+    s_eye_tex[1] = make_hud_tex(eye_sample, 1);
+    s_shuf_tex[0] = make_hud_tex(shuf_sample, 0);
+    s_shuf_tex[1] = make_hud_tex(shuf_sample, 1);
+    s_rep_tex[0] = make_hud_tex(rep_sample, 0);
+    s_rep_tex[1] = make_hud_tex(rep_sample, 1);
+    s_rep_tex[2] = make_hud_tex(rep_sample, 2);
+    s_live_dot_tex = make_hud_tex(live_dot_sample, 0);
+}
+
+static void icon_lock(float x, float y, float s, int locked)
+{
+    unsigned tex = s_lock_tex[locked ? 1 : 0];
+    if (tex) {
+        blit_hud(tex, x, y, s);
+        return;
+    }
+    {
+        float ir = 0.92f, ig = 0.92f, ib = 0.92f;
+        float cx = x + s * 0.56f;
+        float bw = s * 0.46f;
+        float bh = s * 0.34f;
+        float bx = cx - bw * 0.5f;
+        float by = y + s * 0.416f;
+        float t = 3.4f * s_scale;
+        float span = bw * 0.54f;
+        float lx = cx - span * 0.5f;
+        float rx = cx + span * 0.5f;
+        float hx = lx;
+        float fx = locked ? rx : (lx - span);
+        float acx = (hx + fx) * 0.5f;
+        float ar = fabsf(fx - hx) * 0.5f - t * 0.5f;
+        float leg = s * 0.11f;
+        const float pi = 3.14159265f;
+        if (ar < t) {
+            ar = t;
+        }
+        stroke_arc(acx, by, ar, t, pi, pi * 2.f, 12, ir, ig, ib, 1.f);
+        draw_rect(hx - t * 0.5f, by, t, leg, ir, ig, ib, 1.f);
+        draw_rect(fx - t * 0.5f, by, t, leg, ir, ig, ib, 1.f);
+        draw_rect(bx, by, bw, bh, ir, ig, ib, 1.f);
+    }
+}
+
+static void np_compute(void)
+{
+    float bar_x, bar_w, sq, gap, sq_gap, chip_h, left_end, preset_w;
+    int i;
+    s_np.strip_h = 228.f * s_scale;
+    s_np.strip_y = (float)s_win_h - s_np.strip_h;
+    bar_x = 80.f * s_scale;
+    bar_w = (float)s_win_w - 160.f * s_scale;
+    s_np.bar_x = bar_x;
+    s_np.bar_w = bar_w;
+    s_np.bar_h = 8.f * s_scale;
+    s_np.bar_hit = 28.f * s_scale;
+    s_np.bar_y = s_np.strip_y + 150.f * s_scale;
+    chip_h = 36.f * s_scale;
+    sq = chip_h;
+    gap = 12.f * s_scale;
+    sq_gap = 8.f * s_scale;
+    s_np.opt_y = s_np.strip_y + 98.f * s_scale;
+    s_np.sq = sq;
+    s_np.chip_h = chip_h;
+    s_np.bx[NP_OPT_PREV] = bar_x;
+    s_np.bx[NP_OPT_PLAY] = s_np.bx[NP_OPT_PREV] + sq + sq_gap;
+    s_np.bx[NP_OPT_STOP] = s_np.bx[NP_OPT_PLAY] + sq + sq_gap;
+    s_np.bx[NP_OPT_NEXT] = s_np.bx[NP_OPT_STOP] + sq + sq_gap;
+    s_np.bx[NP_OPT_SHUFFLE] = s_np.bx[NP_OPT_NEXT] + sq + gap;
+    s_np.bx[NP_OPT_REPEAT] = s_np.bx[NP_OPT_SHUFFLE] + sq + sq_gap;
+    s_np.bx[NP_OPT_VOLUME] = s_np.bx[NP_OPT_REPEAT] + sq + gap;
+    s_np.bx[NP_OPT_LOCK] = bar_x + bar_w - sq;
+    s_np.bx[NP_OPT_EYE] = s_np.bx[NP_OPT_LOCK] - gap - sq;
+    left_end = s_np.bx[NP_OPT_VOLUME] + sq;
+    preset_w = s_np.bx[NP_OPT_EYE] - gap - left_end;
+    if (preset_w < 140.f * s_scale) {
+        preset_w = 140.f * s_scale;
+    }
+    s_np.bx[NP_OPT_PRESET] = s_np.bx[NP_OPT_EYE] - gap - preset_w;
+    for (i = 1; i <= NP_OPT_MAX; i++) {
+        s_np.bw[i] = sq;
+    }
+    s_np.bw[NP_OPT_PRESET] = preset_w;
+    s_np.vol_pw = 170.f * s_scale;
+    s_np.vol_ph = 300.f * s_scale;
+    s_np.vol_px = s_np.bx[NP_OPT_VOLUME] + (sq - s_np.vol_pw) * 0.5f;
+    s_np.vol_py = s_np.opt_y - s_np.vol_ph - 18.f * s_scale;
+    s_np.vol_tw = 12.f * s_scale;
+    s_np.vol_th = s_np.vol_ph - 62.f * s_scale;
+    s_np.vol_tx = s_np.vol_px + (s_np.vol_pw - s_np.vol_tw) * 0.5f;
+    s_np.vol_ty = s_np.vol_py + 48.f * s_scale;
+}
+
+static void draw_now_playing(struct App *app)
+{
+    float y, bar_x, bar_w, opt_y, bar_y, sq;
+    double dur = decode_duration();
+    double pos = decode_play_position();
+    float t = (dur > 0.1) ? (float)(pos / dur) : 0.f;
+    char a[32], b[32];
+    LibTrack next;
+    int kara = app->playing_karaoke || s_karaoke;
+    int qn = kara ? karaoke_queue_len() : library_queue_len();
+    int qi = kara ? karaoke_queue_index() : library_queue_index();
+
+    np_compute();
+    y = s_np.strip_y;
+    bar_x = s_np.bar_x;
+    bar_w = s_np.bar_w;
+    opt_y = s_np.opt_y;
+    bar_y = s_np.bar_y;
+    sq = s_np.sq;
+    if (t < 0.f) {
+        t = 0.f;
+    }
+    if (t > 1.f) {
+        t = 1.f;
+    }
+    draw_rect(0, y, (float)s_win_w, s_np.strip_h, 0.f, 0.f, 0.f, s_veil);
     flush_color();
 
     draw_text(bar_x, y + 44.f * s_scale,
@@ -2211,8 +3572,15 @@ static void draw_now_playing(struct App *app)
         char icy[VIBE_NAME_MAX];
         icy[0] = '\0';
         if (app->now_valid && (app->playing_radio || decode_is_live())) {
-            decode_icy(icy, (int)sizeof(icy));
-            subln = icy[0] ? icy : "Live";
+            int net = decode_live_net();
+            if (net == 1) {
+                subln = "Connecting to the station";
+            } else if (net == 2) {
+                subln = "No connection  ·  retrying";
+            } else {
+                decode_icy(icy, (int)sizeof(icy));
+                subln = icy[0] ? icy : "Live";
+            }
         } else if (app->now_valid) {
             subln = app->now.artist;
         }
@@ -2220,74 +3588,43 @@ static void draw_now_playing(struct App *app)
     }
     flush_font();
 
-    opt_y = y + 98.f * s_scale;
     {
         char pname[VIBE_NAME_MAX];
         char shown[128];
-        float chip_h = 36.f * s_scale;
-        float sq = chip_h;
-        float lock_w = 300.f * s_scale;
-        float shuf_w = 150.f * s_scale;
-        float rep_w = 150.f * s_scale;
-        float gap = 12.f * s_scale;
-        float sq_gap = 8.f * s_scale;
-        float x_prev = bar_x;
-        float x_play = x_prev + sq + sq_gap;
-        float x_stop = x_play + sq + sq_gap;
-        float x_next = x_stop + sq + sq_gap;
-        float x_shuf = x_next + sq + gap;
-        float x_rep = x_shuf + shuf_w + gap;
-        float x_vol = x_rep + rep_w + gap;
-        float left_end = x_vol + sq;
-        float x_lock = bar_x + bar_w - lock_w;
-        float x_eye = x_lock - gap - sq;
-        float preset_w = x_eye - gap - left_end;
-        float preset_x;
-        if (preset_w < 140.f * s_scale) {
-            preset_w = 140.f * s_scale;
-        }
-        preset_x = x_eye - gap - preset_w;
+        float chip_h = s_np.chip_h;
+        float preset_w = s_np.bw[NP_OPT_PRESET];
+        float preset_x = s_np.bx[NP_OPT_PRESET];
         viz_current_label(pname, sizeof(pname));
         if (!pname[0]) {
             snprintf(pname, sizeof(pname), "Preset");
         }
         fit_text(shown, sizeof(shown), pname, preset_w - 32.f * s_scale, 0.6f);
-        draw_np_square(x_prev, opt_y, sq, s_np_opt == NP_OPT_PREV);
-        icon_prev(x_prev, opt_y, sq);
-        draw_np_square(x_play, opt_y, sq, s_np_opt == NP_OPT_PLAY);
+        draw_np_square(s_np.bx[NP_OPT_PREV], opt_y, sq, s_np_opt == NP_OPT_PREV);
+        icon_prev(s_np.bx[NP_OPT_PREV], opt_y, sq);
+        draw_np_square(s_np.bx[NP_OPT_PLAY], opt_y, sq, s_np_opt == NP_OPT_PLAY);
         if (audio_paused()) {
-            icon_play(x_play, opt_y, sq);
+            icon_play(s_np.bx[NP_OPT_PLAY], opt_y, sq);
         } else {
-            icon_pause(x_play, opt_y, sq);
+            icon_pause(s_np.bx[NP_OPT_PLAY], opt_y, sq);
         }
-        draw_np_square(x_stop, opt_y, sq, s_np_opt == NP_OPT_STOP);
-        icon_stop(x_stop, opt_y, sq);
-        draw_np_square(x_next, opt_y, sq, s_np_opt == NP_OPT_NEXT);
-        icon_next(x_next, opt_y, sq);
-        flush_color();
-        draw_np_chip(x_shuf, opt_y, shuf_w, chip_h, s_np_opt == NP_OPT_SHUFFLE,
-                     app->shuffle ? "Shuffle  On" : "Shuffle  Off");
-        draw_np_chip(x_rep, opt_y, rep_w, chip_h, s_np_opt == NP_OPT_REPEAT,
-                     app->repeat == VIBE_REPEAT_ONE ? "Repeat  One" :
-                     app->repeat == VIBE_REPEAT_ALL ? "Repeat  All" : "Repeat  Off");
-        draw_np_square(x_vol, opt_y, sq, s_np_opt == NP_OPT_VOLUME);
-        icon_speaker(x_vol, opt_y, sq);
+        draw_np_square(s_np.bx[NP_OPT_STOP], opt_y, sq, s_np_opt == NP_OPT_STOP);
+        icon_stop(s_np.bx[NP_OPT_STOP], opt_y, sq);
+        draw_np_square(s_np.bx[NP_OPT_NEXT], opt_y, sq, s_np_opt == NP_OPT_NEXT);
+        icon_next(s_np.bx[NP_OPT_NEXT], opt_y, sq);
+        draw_np_square(s_np.bx[NP_OPT_SHUFFLE], opt_y, sq, s_np_opt == NP_OPT_SHUFFLE);
+        icon_shuffle(s_np.bx[NP_OPT_SHUFFLE], opt_y, sq, app->shuffle);
+        draw_np_square(s_np.bx[NP_OPT_REPEAT], opt_y, sq, s_np_opt == NP_OPT_REPEAT);
+        icon_repeat(s_np.bx[NP_OPT_REPEAT], opt_y, sq, (int)app->repeat);
+        draw_np_square(s_np.bx[NP_OPT_VOLUME], opt_y, sq, s_np_opt == NP_OPT_VOLUME);
+        icon_speaker(s_np.bx[NP_OPT_VOLUME], opt_y, sq);
         flush_color();
         draw_np_chip(preset_x, opt_y, preset_w, chip_h, s_np_opt == NP_OPT_PRESET, shown);
-        draw_np_square(x_eye, opt_y, sq, s_np_opt == NP_OPT_EYE);
-        icon_eye(x_eye, opt_y, sq, viz_enabled());
+        draw_np_square(s_np.bx[NP_OPT_EYE], opt_y, sq, s_np_opt == NP_OPT_EYE);
+        icon_eye(s_np.bx[NP_OPT_EYE], opt_y, sq, viz_enabled());
+        draw_np_square(s_np.bx[NP_OPT_LOCK], opt_y, sq, s_np_opt == NP_OPT_LOCK);
+        icon_lock(s_np.bx[NP_OPT_LOCK], opt_y, sq, viz_locked());
         flush_color();
-        draw_np_chip(x_lock, opt_y, lock_w, chip_h, s_np_opt == NP_OPT_LOCK,
-                     viz_locked() ? "Visualization Locked" : "Visualization Unlocked");
         if (s_vol_open) {
-            float pw = 170.f * s_scale;
-            float ph = 300.f * s_scale;
-            float px = x_vol + (sq - pw) * 0.5f;
-            float py = opt_y - ph - 18.f * s_scale;
-            float tw = 12.f * s_scale;
-            float tx = px + (pw - tw) * 0.5f;
-            float ty = py + 48.f * s_scale;
-            float th = ph - 62.f * s_scale;
             char vl[32];
             if (s_vol_draft < 0.f) {
                 s_vol_draft = 0.f;
@@ -2295,17 +3632,17 @@ static void draw_now_playing(struct App *app)
             if (s_vol_draft > 1.f) {
                 s_vol_draft = 1.f;
             }
-            draw_rect(px, py, pw, ph, 0.f, 0.f, 0.f, 0.82f);
-            draw_rect(tx, ty, tw, th, 1, 1, 1, 0.18f);
-            draw_rect(tx, ty + th - th * s_vol_draft, tw, th * s_vol_draft, 0.95f, 0.95f, 0.95f, 0.95f);
+            draw_rect(s_np.vol_px, s_np.vol_py, s_np.vol_pw, s_np.vol_ph, 0.f, 0.f, 0.f, 0.82f);
+            draw_rect(s_np.vol_tx, s_np.vol_ty, s_np.vol_tw, s_np.vol_th, 1, 1, 1, 0.18f);
+            draw_rect(s_np.vol_tx, s_np.vol_ty + s_np.vol_th - s_np.vol_th * s_vol_draft,
+                      s_np.vol_tw, s_np.vol_th * s_vol_draft, 0.95f, 0.95f, 0.95f, 0.95f);
             snprintf(vl, sizeof(vl), "Volume  %d%%", (int)(s_vol_draft * 100.f + 0.5f));
             flush_color();
-            draw_text(px + (pw - measure_text(vl, 0.6f)) * 0.5f, py + 12.f * s_scale, vl, 0.6f, 0.95f, 0.95f, 0.95f, 1.f);
+            draw_text(s_np.vol_px + (s_np.vol_pw - measure_text(vl, 0.6f)) * 0.5f,
+                      s_np.vol_py + 12.f * s_scale, vl, 0.6f, 0.95f, 0.95f, 0.95f, 1.f);
             flush_font();
         }
     }
-
-    bar_y = y + 150.f * s_scale;
     draw_rect(bar_x, bar_y, bar_w, 8.f * s_scale, 1, 1, 1, 0.18f);
     draw_rect(bar_x, bar_y, bar_w * t, 8.f * s_scale, 0.95f, 0.95f, 0.95f, 0.95f);
     fmt_time(a, sizeof(a), pos);
@@ -2313,19 +3650,65 @@ static void draw_now_playing(struct App *app)
     flush_color();
     {
         char tb[64];
-        if (app->playing_radio || decode_is_live() || dur < 0.5) {
-            snprintf(tb, sizeof(tb), "LIVE");
+        float ty = bar_y + 32.f * s_scale;
+        float tx = bar_x;
+        int live = app->now_valid && (app->playing_radio || decode_is_live());
+        float tr = 0.8f, tg = 0.8f, tbcol = 0.8f;
+        if (live) {
+            int net = decode_live_net();
+            float d = 14.f * s_scale;
+            float cy = ty - 7.f * s_scale;
+            float dr = 0.92f, dg = 0.14f, db = 0.16f;
+            if (net != 0) {
+                dr = 0.95f;
+                dg = 0.55f;
+                db = 0.12f;
+            }
+            if (s_live_dot_tex && net == 0) {
+                blit_hud(s_live_dot_tex, bar_x, cy - d * 0.5f, d);
+            } else {
+                float rad = 5.5f * s_scale;
+                fill_ellipse(bar_x + rad, cy, rad, rad, dr, dg, db, 1.f, 18);
+                flush_color();
+            }
+            tx = bar_x + d * 0.88f + 6.f * s_scale;
+            if (net == 1) {
+                snprintf(tb, sizeof(tb), "CONNECTING");
+                tr = 0.95f;
+                tg = 0.62f;
+                tbcol = 0.22f;
+            } else if (net == 2) {
+                snprintf(tb, sizeof(tb), "NO SIGNAL");
+                tr = 0.95f;
+                tg = 0.45f;
+                tbcol = 0.18f;
+            } else {
+                snprintf(tb, sizeof(tb), "LIVE");
+            }
         } else {
             snprintf(tb, sizeof(tb), "%s  /  %s", a, b);
         }
-        draw_text(bar_x, bar_y + 32.f * s_scale, tb, 0.55f, 0.8f, 0.8f, 0.8f, 1.f);
+        draw_text(tx, ty, tb, 0.55f, tr, tg, tbcol, 1.f);
         if (app->status[0]) {
             draw_text(bar_x + bar_w * 0.55f, bar_y + 32.f * s_scale, app->status, 0.55f, 0.85f, 0.85f, 0.7f, 1.f);
         }
-        if (qn > qi + 1 && library_queue_get(qi + 1, &next) == 0) {
+        {
             char peek[160];
-            snprintf(peek, sizeof(peek), "Up next  %s", next.title);
-            draw_text(bar_x + 180.f * s_scale, bar_y + 32.f * s_scale, peek, 0.55f, 0.7f, 0.7f, 0.7f, 1.f);
+            peek[0] = '\0';
+            if (app->playing_radio) {
+                LibRadioCustom nxt;
+                const char *u = app->radio_url[0] ? app->radio_url : app->now.path;
+                if (library_radio_fav_step(u, 1, &nxt) == 0 &&
+                    (!u || strcmp(nxt.url, u) != 0)) {
+                    snprintf(peek, sizeof(peek), "Up next  %s", nxt.name);
+                }
+            } else if (qn > qi + 1 &&
+                       (kara ? karaoke_queue_get(qi + 1, &next) : library_queue_get(qi + 1, &next)) == 0) {
+                snprintf(peek, sizeof(peek), "Up next  %s", next.title);
+            }
+            if (peek[0]) {
+                draw_text(bar_x + 180.f * s_scale, bar_y + 32.f * s_scale, peek, 0.55f, 0.7f, 0.7f, 0.7f, 1.f);
+            }
         }
         flush_font();
     }
@@ -2335,9 +3718,11 @@ static const char *heading(void)
 {
     switch (s_view) {
     case UI_VIEW_LIBRARY:
-        return "Library";
+        return s_karaoke ? "Karaoke Mode" : "Library";
     case UI_VIEW_ALBUMS:
         return "Albums";
+    case UI_VIEW_SONGS:
+        return "Songs";
     case UI_VIEW_ALBUM_TRACKS:
         return "Album";
     case UI_VIEW_ARTISTS:
@@ -2374,8 +3759,14 @@ static const char *heading(void)
         snprintf(h, sizeof(h), "Presets  %d", viz_preset_count());
         return h;
     }
+    case UI_VIEW_GENRES:
+        return "Genres";
+    case UI_VIEW_GENRE_SONGS:
+        return s_kara_genre[0] ? s_kara_genre : "Genre";
+    case UI_VIEW_SONG_FAVORITES:
+        return "Favorites";
     case UI_VIEW_MUSIC_DIRS:
-        return "Music folder";
+        return s_dir_karaoke ? "Karaoke folder" : "Music folder";
     case UI_VIEW_DIR_BROWSER: {
         static char h[128];
         snprintf(h, sizeof(h), "%s", s_browse[0] ? s_browse : "/");
@@ -2590,13 +3981,46 @@ static void draw_list(struct App *app)
             draw_rect(left - 12.f * s_scale, y, 6.f * s_scale, row_h - 8.f * s_scale,
                       1, 1, 1, 0.95f);
             flush_color();
+        } else if (idx == s_hover_row && !(kb_on() && s_kb_active)) {
+            draw_rect(left - 12.f * s_scale, y, width + 24.f * s_scale, row_h - 8.f * s_scale,
+                      1, 1, 1, 0.05f);
+            flush_color();
         }
-        draw_text_ex(left + 16.f * s_scale, y + 34.f * s_scale, s_rows[idx].line, 0.95f,
-                     0.95f, 0.95f, 0.95f, 1.f,
-                     (s_view == UI_VIEW_FOLDERS || s_view == UI_VIEW_FOLDER_TRACKS) &&
-                         s_rows[idx].kind == UI_KIND_TRACK);
-        if (s_rows[idx].sub[0]) {
-            draw_text(left + 16.f * s_scale, y + 58.f * s_scale, s_rows[idx].sub, 0.55f, 0.7f, 0.7f, 0.7f, 1.f);
+        {
+            const char *line = s_rows[idx].line;
+            const char *sub = s_rows[idx].sub;
+            char marked[192];
+            int cover = 0;
+            if (s_rows[idx].kind == UI_KIND_TRACK && !line[0]) {
+                line = "Unknown";
+            }
+            switch (s_rows[idx].kind) {
+            case UI_KIND_ALBUM:
+                cover = s_karaoke ? 0 : library_queue_cover_album(s_rows[idx].id);
+                break;
+            case UI_KIND_ARTIST:
+                cover = s_karaoke ? 0 : library_queue_cover_artist(s_rows[idx].id);
+                break;
+            case UI_KIND_FOLDER:
+                cover = s_karaoke ? 0 : library_queue_cover_folder(s_rows[idx].id);
+                break;
+            case UI_KIND_PLAYLIST:
+                cover = s_karaoke ? 0 : library_queue_cover_playlist(s_rows[idx].id);
+                break;
+            default:
+                break;
+            }
+            if (cover) {
+                fmt_queue_cover(marked, sizeof(marked), sub, cover);
+                sub = marked;
+            }
+            draw_text_ex(left + 16.f * s_scale, y + 34.f * s_scale, line, 0.95f,
+                         0.95f, 0.95f, 0.95f, 1.f,
+                         (s_view == UI_VIEW_FOLDERS || s_view == UI_VIEW_FOLDER_TRACKS) &&
+                             s_rows[idx].kind == UI_KIND_TRACK);
+            if (sub[0]) {
+                draw_text(left + 16.f * s_scale, y + 58.f * s_scale, sub, 0.55f, 0.7f, 0.7f, 0.7f, 1.f);
+            }
         }
         if (s_view == UI_VIEW_PRESETS && s_rows[idx].kind == UI_KIND_PRESET) {
             int rt = viz_preset_rating((int)s_rows[idx].id);
@@ -2615,16 +4039,39 @@ static void draw_list(struct App *app)
         draw_keyboard();
     }
 
+    {
+        const char *foot = NULL;
+        float fr = 0.85f, fg = 0.85f, fb = 0.7f;
+        if (app && app->playing_radio) {
+            int net = decode_live_net();
+            if (net == 1) {
+                foot = "Connecting to the station";
+                fr = 0.95f;
+                fg = 0.62f;
+                fb = 0.22f;
+            } else if (net == 2) {
+                foot = "No connection  ·  retrying";
+                fr = 0.95f;
+                fg = 0.62f;
+                fb = 0.22f;
+            }
+        }
+        if (!foot && app && app->status[0]) {
+            foot = app->status;
+        }
+        if (foot) {
+            draw_text(left, (float)s_win_h - 48.f * s_scale, foot, 0.55f, fr, fg, fb, 1.f);
+            flush_font();
+        }
+    }
+
     if (uses_letter_jump() && s_nrows > 0 && s_focus >= 0) {
-        char t[8];
         uint32_t now = SDL_GetTicks();
         uint32_t dt = now - s_jump_ms;
         int hot = s_jump_cp && dt < 1200;
         float a = hot ? 0.95f : 0.22f;
-        utf8_put(t, sizeof(t), row_code(s_focus));
-        draw_text((float)s_win_w - 140.f * s_scale, (float)s_win_h * 0.48f,
-                  t, 2.8f, 0.96f, 0.96f, 0.96f, a);
-        flush_font();
+        draw_native_cp((float)s_win_w - 140.f * s_scale, (float)s_win_h * 0.48f,
+                       row_code(s_focus), 2.8f, 0.96f, 0.96f, 0.96f, a);
     }
 }
 
@@ -2633,6 +4080,7 @@ static int uses_letter_jump(void)
     switch (s_view) {
     case UI_VIEW_ALBUMS:
     case UI_VIEW_ALBUM_FAVORITES:
+    case UI_VIEW_SONGS:
     case UI_VIEW_ARTISTS:
     case UI_VIEW_ARTIST_FAVORITES:
     case UI_VIEW_FOLDERS:
@@ -2657,24 +4105,14 @@ static int uses_letter_jump(void)
     }
 }
 
-static uint32_t row_code(int i)
+static uint32_t line_code(const char *s)
 {
-    const char *s;
     uint32_t cp;
-    if (i < 0 || i >= s_nrows) {
+    if (!s) {
         return '#';
     }
-    s = s_rows[i].line;
     while (*s == ' ') {
         s++;
-    }
-    if (s_view == UI_VIEW_ALBUMS || s_view == UI_VIEW_ARTIST_ALBUMS ||
-        s_view == UI_VIEW_ALBUM_FAVORITES) {
-        if (strncasecmp(s, "the ", 4) == 0) {
-            s += 4;
-        } else if (strncasecmp(s, "a ", 2) == 0) {
-            s += 2;
-        }
     }
     if (!*s) {
         return '#';
@@ -2690,6 +4128,30 @@ static uint32_t row_code(int i)
         return '#';
     }
     return cp;
+}
+
+static uint32_t row_code(int i)
+{
+    const char *s;
+    if (i < 0 || i >= s_nrows) {
+        return '#';
+    }
+    if (s_view == UI_VIEW_SONGS && s_rows[i].kind != UI_KIND_TRACK) {
+        return '#';
+    }
+    s = s_rows[i].line;
+    if (s_view == UI_VIEW_ALBUMS || s_view == UI_VIEW_ARTIST_ALBUMS ||
+        s_view == UI_VIEW_ALBUM_FAVORITES) {
+        while (*s == ' ') {
+            s++;
+        }
+        if (strncasecmp(s, "the ", 4) == 0) {
+            s += 4;
+        } else if (strncasecmp(s, "a ", 2) == 0) {
+            s += 2;
+        }
+    }
+    return line_code(s);
 }
 
 static int group_start(int i)
@@ -2708,10 +4170,148 @@ static int group_start(int i)
     return i;
 }
 
+static void songs_letter_flash(void)
+{
+    s_jump_cp = (s_focus >= 0 && s_focus < s_nrows) ? row_code(s_focus) : '#';
+    s_jump_ms = SDL_GetTicks();
+}
+
+static void songs_jump_last_group(void)
+{
+    LibTrack buf[SONG_WIN];
+    uint32_t L;
+    int n = songs_before("", 0, buf, songs_win());
+    if (n <= 0) {
+        songs_fill_start();
+        return;
+    }
+    L = line_code(buf[n - 1].title);
+    n = songs_from_letter(L, buf, songs_win());
+    if (n <= 0) {
+        songs_fill_end();
+        return;
+    }
+    songs_load_tracks(buf, n, 0);
+    s_focus = 0;
+    clamp_focus();
+}
+
+static void songs_letter_jump(int dir)
+{
+    LibTrack buf[SONG_WIN];
+    uint32_t cur = 0, want;
+    int n, i;
+    if (s_nrows <= 0) {
+        songs_fill_start();
+        return;
+    }
+    if (s_focus >= 0 && s_focus < s_nrows && s_rows[s_focus].kind == UI_KIND_TRACK) {
+        cur = row_code(s_focus);
+    }
+    if (dir > 0) {
+        if (cur == 0 || cur == '#') {
+            want = 'A';
+        } else if (cur >= 'A' && cur < 'Z') {
+            want = cur + 1;
+        } else if (cur == 'Z') {
+            songs_fill_start();
+            songs_letter_flash();
+            return;
+        } else {
+            char title[VIBE_NAME_MAX];
+            int64_t id;
+            if (songs_track_key(s_focus, title, (int)sizeof(title), &id) != 0) {
+                songs_fill_start();
+                songs_letter_flash();
+                return;
+            }
+            n = songs_after(title, id, buf, songs_win());
+            while (n > 0) {
+                for (i = 0; i < n; i++) {
+                    if (line_code(buf[i].title) != cur) {
+                        songs_show_at(buf[i].title, buf[i].id);
+                        songs_letter_flash();
+                        return;
+                    }
+                }
+                n = songs_after(buf[n - 1].title, buf[n - 1].id, buf, songs_win());
+            }
+            songs_fill_start();
+            songs_letter_flash();
+            return;
+        }
+        n = songs_from_letter(want, buf, songs_win());
+        if (n <= 0) {
+            songs_fill_start();
+        } else {
+            songs_load_tracks(buf, n, 0);
+            s_focus = 0;
+            clamp_focus();
+        }
+        songs_letter_flash();
+        return;
+    }
+    if (cur == 0) {
+        songs_jump_last_group();
+        songs_letter_flash();
+        return;
+    }
+    if (cur >= 'A' && cur <= 'Z') {
+        int w;
+        for (w = (int)cur - 1; w >= 'A'; w--) {
+            n = songs_from_letter((uint32_t)w, buf, songs_win());
+            if (n > 0 && line_code(buf[0].title) != cur) {
+                songs_load_tracks(buf, n, 0);
+                s_focus = 0;
+                clamp_focus();
+                songs_letter_flash();
+                return;
+            }
+        }
+        n = songs_after("", 0, buf, songs_win());
+        if (n > 0 && line_code(buf[0].title) == '#') {
+            songs_load_tracks(buf, n, 1);
+            s_focus = songs_first_track();
+            if (s_focus < 0) {
+                s_focus = 0;
+            }
+            clamp_focus();
+            songs_letter_flash();
+            return;
+        }
+        songs_jump_last_group();
+        songs_letter_flash();
+        return;
+    }
+    {
+        char title[VIBE_NAME_MAX];
+        int64_t id;
+        if (songs_track_key(s_focus, title, (int)sizeof(title), &id) == 0) {
+            n = songs_before(title, id, buf, songs_win());
+            while (n > 0) {
+                for (i = n - 1; i >= 0; i--) {
+                    if (line_code(buf[i].title) != cur) {
+                        songs_show_at(buf[i].title, buf[i].id);
+                        songs_letter_flash();
+                        return;
+                    }
+                }
+                n = songs_before(buf[0].title, buf[0].id, buf, songs_win());
+            }
+        }
+    }
+    songs_fill_start();
+    songs_letter_flash();
+}
+
 static void letter_jump(int dir)
 {
     uint32_t cur;
     int i;
+    if (s_view == UI_VIEW_SONGS) {
+        songs_letter_jump(dir);
+        return;
+    }
     if (!uses_letter_jump() || s_nrows <= 1 || s_focus < 0) {
         return;
     }
@@ -2744,9 +4344,45 @@ static void letter_jump(int dir)
     s_jump_ms = SDL_GetTicks();
 }
 
+static int queue_focus_index(void);
+
+static int karaoke_set_busy(const struct App *app)
+{
+    return app && app->playing_karaoke &&
+           (app->now_valid || decode_has_file() || app->kara_gap_until ||
+            app->kara_gap_hold_ms);
+}
+
 static int play_focused_track(struct App *app, int64_t id)
 {
     LibTrack t;
+    if (s_karaoke) {
+        if (karaoke_get_song(id, &t) != 0) {
+            return -1;
+        }
+        if (s_view == UI_VIEW_QUEUE) {
+            int qi = queue_focus_index();
+            if (qi < 0) {
+                return -1;
+            }
+            app_play_queue_index(app, qi);
+            karaoke_goto_playing();
+            return 0;
+        }
+        if (karaoke_set_busy(app)) {
+            if (karaoke_queue_add(t.id) != 0) {
+                snprintf(app->status, sizeof(app->status), "Could not queue");
+                return -1;
+            }
+            snprintf(app->status, sizeof(app->status), "Queued  %s", t.title);
+            ui_refresh_lists(app);
+            return 0;
+        }
+        karaoke_queue_play_song(t.id);
+        app_play_queue_index(app, karaoke_queue_index());
+        karaoke_goto_playing();
+        return 0;
+    }
     if (library_get_track(id, &t) != 0) {
         return -1;
     }
@@ -2757,14 +4393,13 @@ static int play_focused_track(struct App *app, int64_t id)
     } else if (s_view == UI_VIEW_FOLDER_TRACKS || s_view == UI_VIEW_FOLDERS) {
         library_queue_play_folder_from(t.folder_id, t.id);
     } else if (s_view == UI_VIEW_QUEUE) {
-        int n = library_queue_len();
-        for (int i = 0; i < n; i++) {
-            LibTrack q;
-            if (library_queue_get(i, &q) == 0 && q.id == t.id) {
-                library_queue_set_index(i);
-                break;
-            }
+        int qi = queue_focus_index();
+        if (qi < 0) {
+            return -1;
         }
+        library_queue_set_index(qi);
+    } else if (s_view == UI_VIEW_SONGS) {
+        library_queue_play_track(t.id);
     } else {
         library_queue_play_track(t.id);
         if (t.album_id) {
@@ -2857,21 +4492,26 @@ static int queue_focus_index(void)
 
 static void after_queue_remove(struct App *app, int removed_current)
 {
-    if (library_queue_len() <= 0) {
+    int n = s_karaoke ? karaoke_queue_len() : library_queue_len();
+    if (n <= 0) {
         app_halt(app);
         snprintf(app->status, sizeof(app->status), "Queue cleared");
         return;
     }
     if (removed_current && !app->playing_radio) {
-        app_play_queue_index(app, library_queue_index());
+        app_play_queue_index(app, s_karaoke ? karaoke_queue_index() : library_queue_index());
     }
 }
 
 static void queue_remove_index(struct App *app, int qi)
 {
-    int cur = library_queue_index();
+    int cur = s_karaoke ? karaoke_queue_index() : library_queue_index();
     int playing = qi == cur && app->now_valid && !app->playing_radio;
-    if (library_queue_remove(qi) != 0) {
+    if (s_karaoke) {
+        if (karaoke_queue_remove(qi) != 0) {
+            return;
+        }
+    } else if (library_queue_remove(qi) != 0) {
         return;
     }
     snprintf(app->status, sizeof(app->status), "Removed from queue");
@@ -2882,7 +4522,7 @@ static void queue_remove_index(struct App *app, int qi)
 static void queue_remove_track_id(struct App *app, int64_t track_id)
 {
     int playing = app->now_valid && !app->playing_radio && app->now.id == track_id;
-    int n = library_queue_remove_track(track_id);
+    int n = s_karaoke ? karaoke_queue_remove_song(track_id) : library_queue_remove_track(track_id);
     if (n <= 0) {
         snprintf(app->status, sizeof(app->status), "Not in queue");
         return;
@@ -2898,28 +4538,46 @@ static void queue_append_focus(struct App *app)
     if (s_focus < 0 || s_focus >= s_nrows) {
         return;
     }
-    switch (s_rows[s_focus].kind) {
-    case UI_KIND_TRACK:
-        n = library_queue_add(s_rows[s_focus].id) == 0 ? 1 : 0;
-        break;
-    case UI_KIND_ALBUM:
-        n = library_queue_add_album(s_rows[s_focus].id);
-        break;
-    case UI_KIND_ARTIST:
-        n = library_queue_add_artist(s_rows[s_focus].id);
-        break;
-    case UI_KIND_FOLDER:
-        n = library_queue_add_folder(s_rows[s_focus].id);
-        break;
-    case UI_KIND_PLAYLIST:
-        n = library_queue_add_playlist(s_rows[s_focus].id);
-        break;
-    default:
-        return;
+    if (s_karaoke) {
+        switch (s_rows[s_focus].kind) {
+        case UI_KIND_TRACK:
+            n = karaoke_queue_add(s_rows[s_focus].id) == 0 ? 1 : 0;
+            break;
+        case UI_KIND_ARTIST:
+            n = karaoke_queue_add_artist(s_rows[s_focus].id);
+            break;
+        case UI_KIND_FOLDER:
+            n = karaoke_queue_add_folder(s_rows[s_focus].id);
+            break;
+        case UI_KIND_GENRE:
+            n = karaoke_queue_add_genre(s_rows[s_focus].line);
+            break;
+        default:
+            return;
+        }
+    } else {
+        switch (s_rows[s_focus].kind) {
+        case UI_KIND_TRACK:
+            n = library_queue_add(s_rows[s_focus].id) == 0 ? 1 : 0;
+            break;
+        case UI_KIND_ALBUM:
+            n = library_queue_add_album(s_rows[s_focus].id);
+            break;
+        case UI_KIND_ARTIST:
+            n = library_queue_add_artist(s_rows[s_focus].id);
+            break;
+        case UI_KIND_FOLDER:
+            n = library_queue_add_folder(s_rows[s_focus].id);
+            break;
+        case UI_KIND_PLAYLIST:
+            n = library_queue_add_playlist(s_rows[s_focus].id);
+            break;
+        default:
+            return;
+        }
     }
     if (n <= 0) {
-        snprintf(app->status, sizeof(app->status),
-                 library_queue_len() >= VIBE_QUEUE_MAX ? "Queue is full" : "Nothing to add");
+        snprintf(app->status, sizeof(app->status), "Nothing to add");
         return;
     }
     snprintf(app->status, sizeof(app->status), n == 1 ? "Added to queue" : "Added %d to queue", n);
@@ -2990,8 +4648,59 @@ static int save_queue_playlist(struct App *app)
     return 0;
 }
 
+static void songs_step(int dir, int repeat)
+{
+    if (s_nrows <= 0) {
+        songs_fill_start();
+        return;
+    }
+    if (dir > 0) {
+        if (s_focus < s_nrows - 1) {
+            s_focus++;
+            clamp_focus();
+            return;
+        }
+        if (songs_slide_down()) {
+            return;
+        }
+        if (!repeat) {
+            songs_fill_start();
+        }
+        return;
+    }
+    if (s_focus > 0) {
+        s_focus--;
+        clamp_focus();
+        return;
+    }
+    if (s_nrows > 0 && s_rows[0].kind == UI_KIND_ACTION && s_rows[0].id == 1) {
+        if (!repeat) {
+            songs_fill_end();
+        }
+        return;
+    }
+    if (songs_slide_up()) {
+        return;
+    }
+    if (!repeat) {
+        songs_fill_start();
+    }
+}
+
+static void songs_page(int dir)
+{
+    int i;
+    for (i = 0; i < 8; i++) {
+        songs_step(dir, 1);
+    }
+}
+
 static void list_step(int dir, int repeat)
 {
+    if (s_view == UI_VIEW_SONGS) {
+        songs_step(dir, repeat);
+        return;
+    }
     if (s_nrows <= 0) {
         s_focus = 0;
         return;
@@ -3033,6 +4742,11 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             s_quit_prompt = 0;
             return 1;
         case VIBE_CMD_BACK:
+            if (app->cfg.karaoke_mode) {
+                s_quit_prompt = 0;
+                karaoke_open_menu(app);
+                return 1;
+            }
             app_persist(app);
             app->running = 0;
             s_quit_prompt = 0;
@@ -3044,25 +4758,48 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             return 1;
         }
     }
+    if (s_ctx_on) {
+        s_ctx_on = 0;
+        if (cmd != VIBE_CMD_LIBRARY && cmd != VIBE_CMD_QUIT) {
+            return 1;
+        }
+    }
     switch (cmd) {
     case VIBE_CMD_CONFIRM_HOLD:
         if (s_hold_kind && s_focus >= 0 && s_focus < s_nrows) {
-            int on = -1;
-            if (s_rows[s_focus].kind == UI_KIND_RADIO) {
-                const char *url = (s_focus >= 0 && s_focus < RADIO_URL_SLOTS) ? s_radio_play_url[s_focus] : "";
-                on = library_radio_fav_toggle(s_rows[s_focus].line, url, s_rows[s_focus].sub);
-            } else if (s_rows[s_focus].kind == UI_KIND_ARTIST) {
-                on = library_artist_fav_toggle(s_rows[s_focus].id);
-            } else if (s_rows[s_focus].kind == UI_KIND_ALBUM) {
-                on = library_album_fav_toggle(s_rows[s_focus].id);
-            } else if (s_rows[s_focus].kind == UI_KIND_PLAYLIST) {
-                on = library_playlist_fav_toggle(s_rows[s_focus].id);
-            }
-            if (on >= 0) {
+            if (s_karaoke) {
+                if (s_rows[s_focus].kind == UI_KIND_TRACK) {
+                    int on = karaoke_song_fav_toggle(s_rows[s_focus].id);
+                    if (on >= 0) {
+                        s_hold_did = 1;
+                        snprintf(app->status, sizeof(app->status),
+                                 on > 0 ? "Favorite" : "Removed from favorites");
+                        ui_refresh_lists(app);
+                    }
+                    return 1;
+                }
+                queue_append_focus(app);
                 s_hold_did = 1;
-                snprintf(app->status, sizeof(app->status),
-                         on > 0 ? "Favorite" : "Removed from favorites");
-                ui_refresh_lists(app);
+                return 1;
+            }
+            {
+                int on = -1;
+                if (s_rows[s_focus].kind == UI_KIND_RADIO) {
+                    const char *url = (s_focus >= 0 && s_focus < RADIO_URL_SLOTS) ? s_radio_play_url[s_focus] : "";
+                    on = library_radio_fav_toggle(s_rows[s_focus].line, url, s_rows[s_focus].sub);
+                } else if (s_rows[s_focus].kind == UI_KIND_ARTIST) {
+                    on = library_artist_fav_toggle(s_rows[s_focus].id);
+                } else if (s_rows[s_focus].kind == UI_KIND_ALBUM) {
+                    on = library_album_fav_toggle(s_rows[s_focus].id);
+                } else if (s_rows[s_focus].kind == UI_KIND_PLAYLIST) {
+                    on = library_playlist_fav_toggle(s_rows[s_focus].id);
+                }
+                if (on >= 0) {
+                    s_hold_did = 1;
+                    snprintf(app->status, sizeof(app->status),
+                             on > 0 ? "Favorite" : "Removed from favorites");
+                    ui_refresh_lists(app);
+                }
             }
         }
         return 1;
@@ -3076,6 +4813,10 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
                 s_ctx_artist = s_rows[s_focus].id;
                 push_view(UI_VIEW_ARTIST_ALBUMS);
                 ui_refresh_lists(app);
+            } else if (s_rows[s_focus].kind == UI_KIND_GENRE) {
+                snprintf(s_kara_genre, sizeof(s_kara_genre), "%s", s_rows[s_focus].line);
+                push_view(UI_VIEW_GENRE_SONGS);
+                ui_refresh_lists(app);
             } else if (s_rows[s_focus].kind == UI_KIND_ALBUM) {
                 s_ctx_album = s_rows[s_focus].id;
                 push_view(UI_VIEW_ALBUM_TRACKS);
@@ -3084,6 +4825,8 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
                 s_ctx_playlist = s_rows[s_focus].id;
                 push_view(UI_VIEW_PLAYLIST_TRACKS);
                 ui_refresh_lists(app);
+            } else if (s_karaoke && s_rows[s_focus].kind == UI_KIND_TRACK) {
+                play_focused_track(app, s_rows[s_focus].id);
             }
         }
         s_hold_kind = 0;
@@ -3093,6 +4836,18 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         s_folder_sp = 0;
         s_ctx_folder = 0;
         s_folder_title[0] = '\0';
+        sync_karaoke(app);
+        if (s_karaoke) {
+            /* Karaoke NP keeps the HUD off so lyrics stay full-screen, and
+             * ui_note_input will not raise the overlay. Opening the catalog
+             * has to turn it on or the list never draws. */
+            if (s_view == UI_VIEW_LIBRARY) {
+                karaoke_goto_playing();
+            } else {
+                karaoke_open_menu(app);
+            }
+            return 1;
+        }
         if (s_view == UI_VIEW_LIBRARY) {
             s_view = UI_VIEW_NOW_PLAYING;
             s_sp = 0;
@@ -3100,6 +4855,8 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             s_sp = 0;
             s_view = UI_VIEW_LIBRARY;
             s_focus = 0;
+            s_overlay = 1;
+            s_idle_on = 0;
             ui_refresh_lists(app);
         }
         return 1;
@@ -3114,20 +4871,28 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
     case VIBE_CMD_BACK:
         if (s_view == UI_VIEW_NOW_PLAYING) {
             if (s_vol_open) {
-                audio_set_volume(s_vol_saved);
                 app->cfg.volume = audio_volume();
                 s_vol_open = 0;
+                config_save(&app->cfg);
+                return 1;
+            }
+            if (app->cfg.karaoke_mode) {
+                karaoke_open_menu(app);
                 return 1;
             }
             if (s_np_opt > 0) {
                 s_np_opt = 0;
                 return 1;
             }
-            if (s_overlay) {
+            if (s_overlay && !app->cfg.np_keep_info) {
                 ui_hide_overlay();
                 return 1;
             }
             open_quit_prompt();
+            return 1;
+        }
+        if (app->cfg.karaoke_mode && s_view == UI_VIEW_LIBRARY) {
+            karaoke_goto_playing();
             return 1;
         }
         if ((s_view == UI_VIEW_FOLDERS || s_view == UI_VIEW_FOLDER_TRACKS) && s_folder_sp > 0) {
@@ -3139,7 +4904,9 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
                 s_folder_title[0] = '\0';
             } else {
                 LibFolder f;
-                if (library_get_folder(s_ctx_folder, &f) == 0) {
+                int got = s_karaoke ? karaoke_get_folder(s_ctx_folder, &f)
+                                    : library_get_folder(s_ctx_folder, &f);
+                if (got == 0) {
                     snprintf(s_folder_title, sizeof(s_folder_title), "%s", f.name);
                 }
             }
@@ -3167,6 +4934,13 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
                 audio_set_volume(s_vol_draft);
                 return 1;
             }
+            if (s_karaoke && !s_overlay) {
+                s_overlay = 1;
+                s_idle_on = 0;
+                s_np_opt = 0;
+                s_last_input = SDL_GetTicks();
+                return 1;
+            }
             s_np_opt = 1;
             return 1;
         }
@@ -3190,6 +4964,15 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
                 audio_set_volume(s_vol_draft);
                 return 1;
             }
+            if (s_karaoke) {
+                if (!s_overlay) {
+                    return 1;
+                }
+                if (s_np_opt == 0) {
+                    ui_hide_overlay();
+                    return 1;
+                }
+            }
             s_np_opt = 0;
             return 1;
         }
@@ -3205,6 +4988,9 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         return 1;
     case VIBE_CMD_LEFT:
         if (s_view == UI_VIEW_NOW_PLAYING) {
+            if (s_karaoke && !s_overlay) {
+                return 1;
+            }
             if (s_np_opt > 1) {
                 s_np_opt--;
             }
@@ -3217,6 +5003,9 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         return 1;
     case VIBE_CMD_RIGHT:
         if (s_view == UI_VIEW_NOW_PLAYING) {
+            if (s_karaoke && !s_overlay) {
+                return 1;
+            }
             if (s_np_opt >= 1 && s_np_opt < NP_OPT_MAX) {
                 s_np_opt++;
             }
@@ -3232,6 +5021,10 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             s_kb_caret = 0;
             return 1;
         }
+        if (s_view == UI_VIEW_SONGS) {
+            songs_page(-1);
+            return 1;
+        }
         s_focus -= 8;
         clamp_focus();
         return 1;
@@ -3240,11 +5033,18 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             s_kb_caret = strlen(kb_buf());
             return 1;
         }
+        if (s_view == UI_VIEW_SONGS) {
+            songs_page(1);
+            return 1;
+        }
         s_focus += 8;
         clamp_focus();
         return 1;
     case VIBE_CMD_CONFIRM:
         if (s_view == UI_VIEW_NOW_PLAYING) {
+            if (s_karaoke && !s_overlay) {
+                return 1;
+            }
             if (s_vol_open) {
                 app->cfg.volume = audio_volume();
                 s_vol_open = 0;
@@ -3266,8 +5066,7 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             } else if (s_np_opt == NP_OPT_REPEAT) {
                 app->repeat = (VibeRepeat)(((int)app->repeat + 1) % 3);
             } else if (s_np_opt == NP_OPT_VOLUME) {
-                s_vol_saved = audio_volume();
-                s_vol_draft = s_vol_saved;
+                s_vol_draft = audio_volume();
                 s_vol_open = 1;
             } else if (s_np_opt == NP_OPT_PRESET) {
                 push_view(UI_VIEW_PRESETS);
@@ -3303,6 +5102,11 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
                 if (s_view == UI_VIEW_RADIO_ADD) {
                     char name[VIBE_NAME_MAX];
                     if (!s_radio_url[0]) {
+                        return 1;
+                    }
+                    if (!radio_url_is_http(s_radio_url)) {
+                        snprintf(app->status, sizeof(app->status),
+                                 "Need an http:// or https:// URL");
                         return 1;
                     }
                     radio_name_from_url(s_radio_url, name, (int)sizeof(name));
@@ -3365,6 +5169,9 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             case 3:
                 push_view(UI_VIEW_ALBUMS);
                 break;
+            case 12:
+                push_view(UI_VIEW_SONGS);
+                break;
             case 4:
                 push_view(UI_VIEW_ARTISTS);
                 break;
@@ -3394,6 +5201,15 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
                 app_persist(app);
                 app->running = 0;
                 return 1;
+            case 20:
+                push_view(UI_VIEW_GENRES);
+                break;
+            case 21:
+                leave_karaoke_mode(app);
+                return 1;
+            case 22:
+                push_view(UI_VIEW_SONG_FAVORITES);
+                break;
             default:
                 break;
             }
@@ -3448,6 +5264,11 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             if (!s_radio_url[0]) {
                 return 1;
             }
+            if (!radio_url_is_http(s_radio_url)) {
+                snprintf(app->status, sizeof(app->status),
+                         "Need an http:// or https:// URL");
+                return 1;
+            }
             radio_name_from_url(s_radio_url, name, (int)sizeof(name));
             if (library_radio_custom_add(name, s_radio_url) == 0) {
                 snprintf(app->status, sizeof(app->status), "Saved");
@@ -3470,6 +5291,44 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             ui_refresh_lists(app);
             return 1;
         }
+        if (s_view == UI_VIEW_SONGS && s_rows[s_focus].kind == UI_KIND_ACTION &&
+            s_rows[s_focus].id == 1) {
+            int n, i, qn;
+            if (!app->shuffle) {
+                app->shuffle = 1;
+                library_session_set_int("shuffle", 1);
+            }
+            if (s_karaoke) {
+                karaoke_queue_clear();
+                n = karaoke_queue_add_all();
+                qn = karaoke_queue_len();
+                if (qn <= 0) {
+                    snprintf(app->status, sizeof(app->status), "No songs");
+                    return 1;
+                }
+                i = rand() % qn;
+                karaoke_queue_set_index(i);
+            } else {
+                n = library_queue_add_all();
+                qn = library_queue_len();
+                if (qn <= 0) {
+                    snprintf(app->status, sizeof(app->status), "No songs");
+                    return 1;
+                }
+                i = rand() % qn;
+                library_queue_set_index(i);
+            }
+            app_play_queue_index(app, i);
+            if (s_karaoke) {
+                karaoke_goto_playing();
+            } else {
+                s_view = UI_VIEW_NOW_PLAYING;
+                s_sp = 0;
+            }
+            snprintf(app->status, sizeof(app->status),
+                     n > 0 ? "Shuffle all  ·  %d songs" : "Shuffle all", n);
+            return 1;
+        }
         if (s_view == UI_VIEW_PLAYLISTS && s_rows[s_focus].kind == UI_KIND_ACTION &&
             s_rows[s_focus].id == 1) {
             push_view(UI_VIEW_PLAYLIST_FAVORITES);
@@ -3484,11 +5343,22 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         if (s_view == UI_VIEW_MUSIC_DIRS) {
             int id = (int)s_rows[s_focus].id;
             if (id == 1) {
-                open_dir_browser(app->cfg.music_dir_count > 0 ? app->cfg.music_dirs[0] : NULL);
+                const char *start = NULL;
+                if (s_dir_karaoke) {
+                    start = app->cfg.karaoke_dir_count > 0 ? app->cfg.karaoke_dirs[0] : NULL;
+                } else {
+                    start = app->cfg.music_dir_count > 0 ? app->cfg.music_dirs[0] : NULL;
+                }
+                open_dir_browser(start);
                 ui_refresh_lists(app);
             } else if (id >= 100) {
                 int idx = id - 100;
-                if (idx >= 0 && idx < app->cfg.music_dir_count) {
+                if (s_dir_karaoke) {
+                    if (idx >= 0 && idx < app->cfg.karaoke_dir_count) {
+                        open_dir_browser(app->cfg.karaoke_dirs[idx]);
+                        ui_refresh_lists(app);
+                    }
+                } else if (idx >= 0 && idx < app->cfg.music_dir_count) {
                     open_dir_browser(app->cfg.music_dirs[idx]);
                     ui_refresh_lists(app);
                 }
@@ -3498,8 +5368,18 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         if (s_view == UI_VIEW_DIR_BROWSER) {
             int id = (int)s_rows[s_focus].id;
             if (id == 1) {
-                if (config_add_music_dir(&app->cfg, s_browse) < 0) {
+                int r = s_dir_karaoke ? config_add_karaoke_dir(&app->cfg, s_browse)
+                                      : config_add_music_dir(&app->cfg, s_browse);
+                if (r == -2) {
+                    snprintf(app->status, sizeof(app->status),
+                             s_dir_karaoke ? "That folder is already in Music"
+                                           : "That folder is already in Karaoke");
+                } else if (r < 0) {
                     snprintf(app->status, sizeof(app->status), "At most %d folders", VIBE_MAX_MUSIC_DIRS);
+                } else if (s_dir_karaoke) {
+                    apply_karaoke_dirs(app);
+                    pop_view();
+                    ui_refresh_lists(app);
                 } else {
                     apply_music_dirs(app);
                     pop_view();
@@ -3530,6 +5410,11 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             s_hold_did = 0;
             return 1;
         }
+        if (s_rows[s_focus].kind == UI_KIND_GENRE) {
+            s_hold_kind = UI_KIND_GENRE;
+            s_hold_did = 0;
+            return 1;
+        }
         if (s_rows[s_focus].kind == UI_KIND_FOLDER) {
             if (s_folder_sp < FOLDER_STACK) {
                 s_folder_stack[s_folder_sp] = s_ctx_folder;
@@ -3550,6 +5435,11 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             return 1;
         }
         if (s_rows[s_focus].kind == UI_KIND_TRACK) {
+            if (s_karaoke) {
+                s_hold_kind = UI_KIND_TRACK;
+                s_hold_did = 0;
+                return 1;
+            }
             play_focused_track(app, s_rows[s_focus].id);
             return 1;
         }
@@ -3568,7 +5458,11 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         if (s_view == UI_VIEW_QUEUE_OPTIONS) {
             int id = (int)s_rows[s_focus].id;
             if (id == 1) {
-                library_queue_clear();
+                if (s_karaoke) {
+                    karaoke_queue_clear();
+                } else {
+                    library_queue_clear();
+                }
                 app_halt(app);
                 snprintf(app->status, sizeof(app->status), "Queue cleared");
                 pop_view();
@@ -3642,7 +5536,31 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
             case 6:
                 app->cfg.start_library = !app->cfg.start_library;
                 break;
+            case 11:
+                app->cfg.np_keep_info = !app->cfg.np_keep_info;
+                if (app->cfg.np_keep_info) {
+                    s_overlay = 1;
+                    s_idle_on = 0;
+                }
+                break;
+            case 12:
+                app->cfg.vsync = !app->cfg.vsync;
+                plat_set_vsync(app->cfg.vsync);
+                break;
             case 8:
+                s_dir_karaoke = 0;
+                push_view(UI_VIEW_MUSIC_DIRS);
+                ui_refresh_lists(app);
+                return 1;
+            case 13:
+                if (app->cfg.karaoke_mode) {
+                    leave_karaoke_mode(app);
+                } else {
+                    enter_karaoke_mode(app);
+                }
+                return 1;
+            case 14:
+                s_dir_karaoke = 1;
                 push_view(UI_VIEW_MUSIC_DIRS);
                 ui_refresh_lists(app);
                 return 1;
@@ -3693,11 +5611,13 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         }
         if (s_view == UI_VIEW_NOW_PLAYING) {
             if (app->now_valid && !app->playing_radio && app->now.id > 0) {
-                if (library_queue_add(app->now.id) == 0) {
+                int ok = (app->playing_karaoke || s_karaoke)
+                             ? karaoke_queue_add(app->now.id) == 0
+                             : library_queue_add(app->now.id) == 0;
+                if (ok) {
                     snprintf(app->status, sizeof(app->status), "Added to queue");
                 } else {
-                    snprintf(app->status, sizeof(app->status),
-                             library_queue_len() >= VIBE_QUEUE_MAX ? "Queue is full" : "Nothing to add");
+                    snprintf(app->status, sizeof(app->status), "Nothing to add");
                 }
             }
             return 1;
@@ -3731,7 +5651,13 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
         }
         if (s_view == UI_VIEW_MUSIC_DIRS && s_focus >= 0 && s_focus < s_nrows) {
             int idx = (int)s_rows[s_focus].id - 100;
-            if (idx >= 0 && idx < app->cfg.music_dir_count) {
+            if (s_dir_karaoke) {
+                if (idx >= 0 && idx < app->cfg.karaoke_dir_count) {
+                    config_remove_karaoke_dir(&app->cfg, idx);
+                    apply_karaoke_dirs(app);
+                    ui_refresh_lists(app);
+                }
+            } else if (idx >= 0 && idx < app->cfg.music_dir_count) {
                 config_remove_music_dir(&app->cfg, idx);
                 apply_music_dirs(app);
                 ui_refresh_lists(app);
@@ -3779,6 +5705,633 @@ int ui_handle(struct App *app, VibeCmd cmd, float seek_axis, int repeat)
     }
 }
 
+static int hit_rect(float mx, float my, float x, float y, float w, float h)
+{
+    return mx >= x && mx <= x + w && my >= y && my <= y + h;
+}
+
+static int list_hit_row(float mx, float my)
+{
+    float top = 110.f * s_scale;
+    float row_h = 72.f * s_scale;
+    float left = 64.f * s_scale;
+    float width = (float)s_win_w - 128.f * s_scale;
+    int vis, i;
+    if (kb_on()) {
+        float fx, fy, fw, fh;
+        kb_field_geom(&fx, &fy, &fw, &fh);
+        top = fy + fh + 16.f * s_scale;
+    }
+    vis = list_vis_rows();
+    if (mx < left - 12.f * s_scale || mx > left + width + 12.f * s_scale) {
+        return -1;
+    }
+    if (my < top) {
+        return -1;
+    }
+    i = (int)((my - top) / row_h);
+    if (i < 0 || i >= vis) {
+        return -1;
+    }
+    i = s_scroll + i;
+    if (i < 0 || i >= s_nrows) {
+        return -1;
+    }
+    return i;
+}
+
+static int np_hit_opt(float mx, float my)
+{
+    int i;
+    np_compute();
+    for (i = 1; i <= NP_OPT_MAX; i++) {
+        float w = s_np.bw[i] > 0.f ? s_np.bw[i] : s_np.sq;
+        if (hit_rect(mx, my, s_np.bx[i], s_np.opt_y, w, s_np.chip_h)) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+static int np_hit_seek(float mx, float my)
+{
+    float y;
+    np_compute();
+    y = s_np.bar_y + s_np.bar_h * 0.5f - s_np.bar_hit * 0.5f;
+    return hit_rect(mx, my, s_np.bar_x, y, s_np.bar_w, s_np.bar_hit);
+}
+
+static void vol_from_y(float my)
+{
+    float t;
+    np_compute();
+    t = 1.f - (my - s_np.vol_ty) / s_np.vol_th;
+    if (t < 0.f) {
+        t = 0.f;
+    }
+    if (t > 1.f) {
+        t = 1.f;
+    }
+    s_vol_draft = t;
+    audio_set_volume(s_vol_draft);
+}
+
+static void vol_close_save(struct App *app)
+{
+    if (!s_vol_open) {
+        return;
+    }
+    app->cfg.volume = audio_volume();
+    s_vol_open = 0;
+    s_vol_wheel = 0;
+    s_mouse_drag = 0;
+    config_save(&app->cfg);
+}
+
+static void ctx_add(int act, const char *lab)
+{
+    if (s_ctx_n >= CTX_NMAX || !lab) {
+        return;
+    }
+    s_ctx_act[s_ctx_n] = act;
+    snprintf(s_ctx_lab[s_ctx_n], sizeof(s_ctx_lab[0]), "%s", lab);
+    s_ctx_n++;
+}
+
+static void ctx_open(struct App *app, float mx, float my, int row)
+{
+    const Row *r;
+    s_ctx_on = 0;
+    s_ctx_n = 0;
+    s_ctx_hover = -1;
+    s_ctx_row = row;
+    if (row < 0 || row >= s_nrows) {
+        return;
+    }
+    r = &s_rows[row];
+    if (r->kind == UI_KIND_TRACK) {
+        int play_next = s_karaoke && karaoke_set_busy(app) && s_view != UI_VIEW_QUEUE;
+        ctx_add(CTX_ACT_PLAY, play_next ? "Add to queue" : "Play");
+        if (s_view == UI_VIEW_QUEUE) {
+            ctx_add(CTX_ACT_REMOVE_Q, "Remove from queue");
+        } else {
+            ctx_add(CTX_ACT_QUEUE, "Add to current queue");
+            if (queue_has_id(r->id)) {
+                ctx_add(CTX_ACT_REMOVE_Q, "Remove from queue");
+            }
+        }
+        if (s_karaoke) {
+            if (karaoke_song_fav_has(r->id)) {
+                ctx_add(CTX_ACT_UNFAV, "Remove from favorites");
+            } else {
+                ctx_add(CTX_ACT_FAV, "Add to favorites");
+            }
+        }
+    } else if (r->kind == UI_KIND_ALBUM) {
+        ctx_add(CTX_ACT_PLAY, "Open");
+        ctx_add(CTX_ACT_QUEUE, "Add to current queue");
+        if (library_album_fav_has(r->id)) {
+            ctx_add(CTX_ACT_UNFAV, "Remove from favorites");
+        } else {
+            ctx_add(CTX_ACT_FAV, "Add to favorites");
+        }
+    } else if (r->kind == UI_KIND_ARTIST) {
+        ctx_add(CTX_ACT_PLAY, "Open");
+        ctx_add(CTX_ACT_QUEUE, "Add to current queue");
+        if (!s_karaoke) {
+            if (library_artist_fav_has(r->id)) {
+                ctx_add(CTX_ACT_UNFAV, "Remove from favorites");
+            } else {
+                ctx_add(CTX_ACT_FAV, "Add to favorites");
+            }
+        }
+    } else if (r->kind == UI_KIND_GENRE) {
+        ctx_add(CTX_ACT_PLAY, "Open");
+        ctx_add(CTX_ACT_QUEUE, "Add to current queue");
+    } else if (r->kind == UI_KIND_FOLDER) {
+        ctx_add(CTX_ACT_PLAY, "Open");
+        ctx_add(CTX_ACT_QUEUE, "Add to current queue");
+    } else if (r->kind == UI_KIND_PLAYLIST && r->id > 0) {
+        ctx_add(CTX_ACT_PLAY, "Open");
+        ctx_add(CTX_ACT_QUEUE, "Add to current queue");
+        if (library_playlist_fav_has(r->id)) {
+            ctx_add(CTX_ACT_UNFAV, "Remove from favorites");
+        } else {
+            ctx_add(CTX_ACT_FAV, "Add to favorites");
+        }
+    } else if (r->kind == UI_KIND_RADIO) {
+        ctx_add(CTX_ACT_PLAY, "Play");
+        {
+            const char *url = (row >= 0 && row < RADIO_URL_SLOTS) ? s_radio_play_url[row] : "";
+            if (library_radio_fav_has(url)) {
+                ctx_add(CTX_ACT_UNFAV, "Remove from favorites");
+            } else {
+                ctx_add(CTX_ACT_FAV, "Add to favorites");
+            }
+        }
+        if (s_view == UI_VIEW_RADIO_CUSTOM) {
+            ctx_add(CTX_ACT_REMOVE_RADIO, "Remove station");
+        }
+    } else if (s_view == UI_VIEW_MUSIC_DIRS && r->id >= 100) {
+        ctx_add(CTX_ACT_REMOVE_DIR, "Remove folder");
+    } else {
+        return;
+    }
+    if (s_ctx_n <= 0) {
+        return;
+    }
+    s_ctx_ih = 48.f * s_scale;
+    s_ctx_w = 360.f * s_scale;
+    s_ctx_x = mx;
+    s_ctx_y = my;
+    if (s_ctx_x + s_ctx_w > (float)s_win_w - 16.f * s_scale) {
+        s_ctx_x = (float)s_win_w - s_ctx_w - 16.f * s_scale;
+    }
+    if (s_ctx_y + s_ctx_ih * (float)s_ctx_n > (float)s_win_h - 16.f * s_scale) {
+        s_ctx_y = (float)s_win_h - s_ctx_ih * (float)s_ctx_n - 16.f * s_scale;
+    }
+    if (s_ctx_x < 16.f * s_scale) {
+        s_ctx_x = 16.f * s_scale;
+    }
+    if (s_ctx_y < 16.f * s_scale) {
+        s_ctx_y = 16.f * s_scale;
+    }
+    s_ctx_on = 1;
+}
+
+static void ctx_run(struct App *app, int act)
+{
+    int row = s_ctx_row;
+    s_ctx_on = 0;
+    if (row < 0 || row >= s_nrows || act <= 0) {
+        return;
+    }
+    s_focus = row;
+    switch (act) {
+    case CTX_ACT_PLAY:
+        ui_handle(app, VIBE_CMD_CONFIRM, 0.f, 0);
+        if (s_hold_kind) {
+            ui_handle(app, VIBE_CMD_CONFIRM_UP, 0.f, 0);
+        }
+        break;
+    case CTX_ACT_QUEUE:
+        queue_append_focus(app);
+        break;
+    case CTX_ACT_FAV:
+    case CTX_ACT_UNFAV:
+        s_hold_kind = s_rows[row].kind;
+        s_hold_did = 0;
+        ui_handle(app, VIBE_CMD_CONFIRM_HOLD, 0.f, 0);
+        s_hold_kind = 0;
+        s_hold_did = 0;
+        break;
+    case CTX_ACT_REMOVE_Q: {
+        int qi = queue_focus_index();
+        if (qi >= 0) {
+            queue_remove_index(app, qi);
+        } else if (s_rows[row].kind == UI_KIND_TRACK) {
+            queue_remove_track_id(app, s_rows[row].id);
+        }
+        break;
+    }
+    case CTX_ACT_REMOVE_DIR:
+        ui_handle(app, VIBE_CMD_SEARCH_OR_REMOVE, 0.f, 0);
+        break;
+    case CTX_ACT_REMOVE_RADIO:
+        ui_handle(app, VIBE_CMD_SEARCH_OR_REMOVE, 0.f, 0);
+        break;
+    default:
+        break;
+    }
+}
+
+static void draw_ctx_menu(void)
+{
+    int i;
+    float h;
+    if (!s_ctx_on || s_ctx_n <= 0) {
+        return;
+    }
+    h = s_ctx_ih * (float)s_ctx_n;
+    draw_rect(s_ctx_x - 4.f * s_scale, s_ctx_y - 4.f * s_scale,
+              s_ctx_w + 8.f * s_scale, h + 8.f * s_scale, 0.f, 0.f, 0.f, 0.55f);
+    draw_rect(s_ctx_x, s_ctx_y, s_ctx_w, h, 0.06f, 0.07f, 0.09f, 0.96f);
+    flush_color();
+    for (i = 0; i < s_ctx_n; i++) {
+        float y = s_ctx_y + (float)i * s_ctx_ih;
+        if (i == s_ctx_hover) {
+            draw_rect(s_ctx_x, y, s_ctx_w, s_ctx_ih, 1, 1, 1, 0.12f);
+            flush_color();
+        }
+        draw_text(s_ctx_x + 18.f * s_scale, y + 32.f * s_scale,
+                  s_ctx_lab[i], 0.62f, 0.95f, 0.95f, 0.95f, 1.f);
+        flush_font();
+    }
+}
+
+static void mouse_click_row(struct App *app, int idx)
+{
+    if (idx < 0 || idx >= s_nrows) {
+        return;
+    }
+    s_focus = idx;
+    s_kb_active = 0;
+    ui_handle(app, VIBE_CMD_CONFIRM, 0.f, 0);
+    if (s_hold_kind) {
+        ui_handle(app, VIBE_CMD_CONFIRM_UP, 0.f, 0);
+    }
+}
+
+static int mouse_kb(struct App *app, float mx, float my, int click)
+{
+    float fx, fy, fw, fh;
+    const KbKey *keys;
+    int n, i;
+    float cell, kb_w, kx, ky, row_h;
+    if (!kb_on()) {
+        return 0;
+    }
+    kb_field_geom(&fx, &fy, &fw, &fh);
+    if (hit_rect(mx, my, fx, fy, fw, fh)) {
+        s_kb_active = 1;
+        s_kb_zone = KB_ZONE_FIELD;
+        return 1;
+    }
+    keys = kb_cur();
+    n = kb_count();
+    cell = 56.f * s_scale;
+    kb_w = (float)KB_COLS * cell;
+    kx = ((float)s_win_w - kb_w) * 0.5f;
+    ky = (float)s_win_h - 318.f * s_scale;
+    row_h = 48.f * s_scale;
+    if (kx < 24.f * s_scale) {
+        kx = 24.f * s_scale;
+    }
+    for (i = 0; i < n; i++) {
+        float x = kx + (float)keys[i].col * cell;
+        float y = ky + (float)keys[i].row * row_h;
+        float w = (float)keys[i].span * cell - 8.f * s_scale;
+        float h = 42.f * s_scale;
+        if (hit_rect(mx, my, x, y, w, h)) {
+            s_kb_active = 1;
+            s_kb_zone = KB_ZONE_KEYS;
+            s_kb_i = i;
+            if (click) {
+                ui_handle(app, VIBE_CMD_CONFIRM, 0.f, 0);
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int mouse_quit(struct App *app, float mx, float my, int click)
+{
+    const char *stay = "No! I want to keep StOMPing!";
+    const char *quit = "Quit";
+    float pad = 48.f * s_scale;
+    float gap = 16.f * s_scale;
+    float bh = 56.f * s_scale;
+    float sc = 0.6f;
+    float stay_w = measure_text(stay, sc) + 48.f * s_scale;
+    float quit_w = measure_text(quit, sc) + 48.f * s_scale;
+    float w, h = 280.f * s_scale, x, y, by, stay_x, quit_x;
+    if (stay_w < 280.f * s_scale) {
+        stay_w = 280.f * s_scale;
+    }
+    if (quit_w < 140.f * s_scale) {
+        quit_w = 140.f * s_scale;
+    }
+    w = pad * 2.f + stay_w + gap + quit_w;
+    if (w < 640.f * s_scale) {
+        w = 640.f * s_scale;
+    }
+    x = ((float)s_win_w - w) * 0.5f;
+    y = ((float)s_win_h - h) * 0.5f;
+    by = y + h - 88.f * s_scale;
+    stay_x = x + pad;
+    quit_x = x + w - pad - quit_w;
+    if (hit_rect(mx, my, stay_x, by, stay_w, bh)) {
+        s_quit_choice = 0;
+        if (click) {
+            s_quit_prompt = 0;
+        }
+        return 1;
+    }
+    if (hit_rect(mx, my, quit_x, by, quit_w, bh)) {
+        s_quit_choice = 1;
+        if (click) {
+            app_persist(app);
+            app->running = 0;
+            s_quit_prompt = 0;
+        }
+        return 1;
+    }
+    if (click && !hit_rect(mx, my, x, y, w, h)) {
+        s_quit_prompt = 0;
+        return 1;
+    }
+    return click ? 1 : 0;
+}
+
+static int mouse_wheel_y(const SDL_Event *ev)
+{
+    int y = ev->wheel.y;
+    if (ev->wheel.direction == SDL_MOUSEWHEEL_FLIPPED) {
+        y = -y;
+    }
+    return y;
+}
+
+int ui_mouse(struct App *app, const SDL_Event *ev)
+{
+    float mx, my;
+    int wy = 0;
+    if (!app || !ev) {
+        return 0;
+    }
+    mouse_cursor(1);
+    mx = 0.f;
+    my = 0.f;
+    if (ev->type == SDL_MOUSEMOTION) {
+        mx = (float)ev->motion.x;
+        my = (float)ev->motion.y;
+    } else if (ev->type == SDL_MOUSEWHEEL) {
+        int wx, wyi;
+        SDL_GetMouseState(&wx, &wyi);
+        mx = (float)wx;
+        my = (float)wyi;
+        wy = mouse_wheel_y(ev);
+    } else if (ev->type == SDL_MOUSEBUTTONDOWN || ev->type == SDL_MOUSEBUTTONUP) {
+        mx = (float)ev->button.x;
+        my = (float)ev->button.y;
+    }
+    s_last_input = SDL_GetTicks();
+    if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_X1) {
+        ui_handle(app, VIBE_CMD_BACK, 0.f, 0);
+        return 1;
+    }
+    if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_MIDDLE) {
+        if (!(s_karaoke && s_view == UI_VIEW_NOW_PLAYING && !s_overlay)) {
+            app_toggle_pause(app);
+        }
+        return 1;
+    }
+    if (s_quit_prompt) {
+        if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
+            return mouse_quit(app, mx, my, 1);
+        }
+        if (ev->type == SDL_MOUSEMOTION) {
+            mouse_quit(app, mx, my, 0);
+        }
+        return 1;
+    }
+    if (s_ctx_on) {
+        float h = s_ctx_ih * (float)s_ctx_n;
+        int item = -1;
+        if (hit_rect(mx, my, s_ctx_x, s_ctx_y, s_ctx_w, h)) {
+            item = (int)((my - s_ctx_y) / s_ctx_ih);
+            if (item < 0 || item >= s_ctx_n) {
+                item = -1;
+            }
+        }
+        s_ctx_hover = item;
+        if (ev->type == SDL_MOUSEBUTTONDOWN) {
+            if (item >= 0 && ev->button.button == SDL_BUTTON_LEFT) {
+                ctx_run(app, s_ctx_act[item]);
+                return 1;
+            }
+            s_ctx_on = 0;
+            if (ev->button.button != SDL_BUTTON_RIGHT) {
+                return 1;
+            }
+        } else if (ev->type == SDL_MOUSEWHEEL) {
+            s_ctx_on = 0;
+            return 1;
+        } else {
+            return 1;
+        }
+    }
+    if (ev->type == SDL_MOUSEBUTTONUP) {
+        if (s_mouse_drag == 2) {
+            app->cfg.volume = audio_volume();
+            config_save(&app->cfg);
+        }
+        s_mouse_drag = 0;
+        return 1;
+    }
+    if (ev->type == SDL_MOUSEMOTION && s_mouse_drag == 1) {
+        np_compute();
+        if (s_np.bar_w > 1.f) {
+            app_seek_frac(app, (mx - s_np.bar_x) / s_np.bar_w);
+        }
+        return 1;
+    }
+    if (ev->type == SDL_MOUSEMOTION && s_mouse_drag == 2) {
+        vol_from_y(my);
+        return 1;
+    }
+    if (s_view == UI_VIEW_NOW_PLAYING) {
+        int vol_hot;
+        np_compute();
+        if (!s_overlay) {
+            /* Last pixel row of the window. Motion anywhere else must leave lyrics alone. */
+            int at_bottom = s_win_h > 0 && (int)my >= s_win_h - 1;
+            if (!at_bottom) {
+                if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_RIGHT) {
+                    ui_handle(app, VIBE_CMD_LIBRARY, 0.f, 0);
+                }
+                return 1;
+            }
+            if (ev->type == SDL_MOUSEMOTION ||
+                ev->type == SDL_MOUSEBUTTONDOWN ||
+                ev->type == SDL_MOUSEWHEEL) {
+                ui_show_overlay();
+                if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
+                    return 1;
+                }
+                if (ev->type == SDL_MOUSEWHEEL) {
+                    return 1;
+                }
+            }
+        }
+        vol_hot = s_vol_open || s_vol_wheel ||
+                  np_hit_opt(mx, my) == NP_OPT_VOLUME ||
+                  (s_vol_open && hit_rect(mx, my, s_np.vol_px, s_np.vol_py, s_np.vol_pw, s_np.vol_ph));
+        if (ev->type == SDL_MOUSEWHEEL) {
+            if (vol_hot) {
+                float d = wy > 0 ? 0.04f : (wy < 0 ? -0.04f : 0.f);
+                if (d == 0.f) {
+                    return 1;
+                }
+                if (!s_vol_open) {
+                    s_vol_draft = audio_volume();
+                    s_vol_open = 1;
+                }
+                s_vol_draft += d;
+                if (s_vol_draft < 0.f) {
+                    s_vol_draft = 0.f;
+                }
+                if (s_vol_draft > 1.f) {
+                    s_vol_draft = 1.f;
+                }
+                audio_set_volume(s_vol_draft);
+                app->cfg.volume = s_vol_draft;
+                return 1;
+            }
+            if (wy != 0) {
+                app_seek_delta(app, wy > 0 ? 5.0 : -5.0);
+            }
+            return 1;
+        }
+        if (ev->type == SDL_MOUSEMOTION) {
+            int opt = np_hit_opt(mx, my);
+            if (np_hit_seek(mx, my)) {
+                s_np_opt = 0;
+            } else if (opt) {
+                s_np_opt = opt;
+            }
+            return 1;
+        }
+        if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_RIGHT) {
+            ui_handle(app, VIBE_CMD_LIBRARY, 0.f, 0);
+            return 1;
+        }
+        if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
+            int opt;
+            if (s_vol_open) {
+                if (hit_rect(mx, my, s_np.vol_px, s_np.vol_py, s_np.vol_pw, s_np.vol_ph)) {
+                    vol_from_y(my);
+                    s_mouse_drag = 2;
+                    s_vol_wheel = 1;
+                    return 1;
+                }
+                if (!hit_rect(mx, my, s_np.bx[NP_OPT_VOLUME], s_np.opt_y, s_np.sq, s_np.chip_h)) {
+                    vol_close_save(app);
+                    return 1;
+                }
+            }
+            if (np_hit_seek(mx, my)) {
+                if (s_np.bar_w > 1.f) {
+                    app_seek_frac(app, (mx - s_np.bar_x) / s_np.bar_w);
+                }
+                s_mouse_drag = 1;
+                s_np_opt = 0;
+                return 1;
+            }
+            opt = np_hit_opt(mx, my);
+            if (opt) {
+                s_np_opt = opt;
+                s_vol_wheel = (opt == NP_OPT_VOLUME);
+                ui_handle(app, VIBE_CMD_CONFIRM, 0.f, 0);
+                return 1;
+            }
+            if (my < s_np.strip_y) {
+                app_toggle_pause(app);
+            }
+            return 1;
+        }
+        return 1;
+    }
+    if (ev->type == SDL_MOUSEWHEEL) {
+        int n = wy > 0 ? -1 : 1;
+        int k;
+        if (wy == 0) {
+            return 1;
+        }
+        for (k = 0; k < 3; k++) {
+            if (s_view == UI_VIEW_SONGS) {
+                songs_step(n, 1);
+            } else {
+                list_step(n, 1);
+            }
+        }
+        return 1;
+    }
+    if (ev->type == SDL_MOUSEMOTION) {
+        int row;
+        if (mouse_kb(app, mx, my, 0)) {
+            s_hover_row = -1;
+            return 1;
+        }
+        row = list_hit_row(mx, my);
+        s_hover_row = row;
+        if (row >= 0) {
+            s_focus = row;
+        }
+        return 1;
+    }
+    if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_RIGHT) {
+        int row = list_hit_row(mx, my);
+        if (row >= 0) {
+            s_focus = row;
+            ctx_open(app, mx, my, row);
+            if (s_ctx_on) {
+                return 1;
+            }
+        }
+        ui_handle(app, VIBE_CMD_LIBRARY, 0.f, 0);
+        return 1;
+    }
+    if (ev->type == SDL_MOUSEBUTTONDOWN && ev->button.button == SDL_BUTTON_LEFT) {
+        int row;
+        s_vol_wheel = 0;
+        if (mouse_kb(app, mx, my, 1)) {
+            return 1;
+        }
+        row = list_hit_row(mx, my);
+        if (row >= 0) {
+            mouse_click_row(app, row);
+            return 1;
+        }
+        if (my < 110.f * s_scale) {
+            ui_handle(app, VIBE_CMD_BACK, 0.f, 0);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 void ui_text_input(const char *text)
 {
     if (!text || !kb_on()) {
@@ -3787,6 +6340,94 @@ void ui_text_input(const char *text)
     s_kb_active = 1;
     s_kb_zone = KB_ZONE_FIELD;
     kb_insert(text);
+}
+
+static void draw_karaoke_up_next(struct App *app)
+{
+    LibTrack t;
+    char num[8], title[160], artist[160];
+    int n, i, remain, secs;
+    float cx, y, max_w, tw;
+    if (!app || !app->kara_gap_until || s_view != UI_VIEW_NOW_PLAYING) {
+        return;
+    }
+    n = karaoke_queue_len();
+    i = karaoke_queue_index();
+    if (i < 0 || i >= n || karaoke_queue_get(i, &t) != 0) {
+        return;
+    }
+    remain = (int)(app->kara_gap_until - SDL_GetTicks());
+    if (remain < 0) {
+        remain = 0;
+    }
+    secs = (remain + 999) / 1000;
+    if (secs < 1) {
+        secs = 1;
+    }
+    if (secs > 5) {
+        secs = 5;
+    }
+    snprintf(num, sizeof(num), "%d", secs);
+    max_w = (float)s_win_w * 0.86f;
+    fit_text(title, sizeof(title), t.title[0] ? t.title : "Next song", max_w, 1.15f);
+    fit_text(artist, sizeof(artist), t.artist, max_w, 0.75f);
+    draw_rect(0, 0, (float)s_win_w, (float)s_win_h, 0.f, 0.f, 0.f, 0.42f);
+    flush_color();
+    cx = (float)s_win_w * 0.5f;
+    y = (float)s_win_h * 0.26f;
+    tw = measure_text("Up Next", 1.25f);
+    draw_text(cx - tw * 0.5f, y, "Up Next", 1.25f, 0.96f, 0.96f, 0.96f, 1.f);
+    flush_font();
+    {
+        uint32_t cp = (uint32_t)num[0];
+        float want = s_size_px * 3.4f * s_scale;
+        int px = (int)(want + 0.5f);
+        float k, dx;
+        if (px < 8) {
+            px = 8;
+        }
+        if (px > 256) {
+            px = 256;
+        }
+        k = want / (float)px;
+        if (ensure_jumbo(cp, px) == 0) {
+            dx = cx - (s_jumbo_ax + s_jumbo_bw * 0.5f) * k;
+            draw_native_cp(dx, y + 200.f * s_scale, cp, 3.4f, 0.98f, 0.98f, 0.98f, 1.f);
+        }
+    }
+    tw = measure_text(title, 1.15f);
+    draw_text(cx - tw * 0.5f, y + 360.f * s_scale, title, 1.15f, 0.95f, 0.95f, 0.95f, 1.f);
+    if (artist[0]) {
+        tw = measure_text(artist, 0.75f);
+        draw_text(cx - tw * 0.5f, y + 420.f * s_scale, artist, 0.75f, 0.72f, 0.72f, 0.72f, 1.f);
+    }
+    flush_font();
+}
+
+static void draw_radio_net(struct App *app)
+{
+    int net;
+    const char *line;
+    float h, tw, x, y;
+    if (!app || !app->playing_radio) {
+        return;
+    }
+    net = decode_live_net();
+    if (net == 0) {
+        return;
+    }
+    if (s_overlay) {
+        return;
+    }
+    line = net == 1 ? "Connecting to the station" : "No connection  ·  retrying";
+    h = 72.f * s_scale;
+    draw_rect(0.f, 0.f, (float)s_win_w, h, 0.f, 0.f, 0.f, 0.78f);
+    flush_color();
+    tw = measure_text(line, 0.75f);
+    x = ((float)s_win_w - tw) * 0.5f;
+    y = 48.f * s_scale;
+    draw_text(x, y, line, 0.75f, 0.95f, 0.62f, 0.22f, 1.f);
+    flush_font();
 }
 
 void ui_draw(struct App *app)
@@ -3812,7 +6453,10 @@ void ui_draw(struct App *app)
         } else {
             draw_list(app);
         }
+        draw_ctx_menu();
     }
+    draw_karaoke_up_next(app);
+    draw_radio_net(app);
     if (s_quit_prompt) {
         draw_quit_prompt();
     }
@@ -3824,11 +6468,10 @@ void ui_draw(struct App *app)
             float x = (float)s_win_w - 200.f * s_scale;
             float y = (float)s_win_h - 80.f * s_scale;
             if (s_rate_flash_good) {
-                draw_text(x, y, "\xE2\x9C\x94", 4.2f, 0.22f, 0.92f, 0.38f, a);
+                draw_native_cp(x, y, 0x2714, 4.2f, 0.22f, 0.92f, 0.38f, a);
             } else {
-                draw_text(x, y, "\xE2\x9C\x96", 4.2f, 0.92f, 0.28f, 0.28f, a);
+                draw_native_cp(x, y, 0x2716, 4.2f, 0.92f, 0.28f, 0.28f, a);
             }
-            flush_font();
         } else {
             s_rate_flash_ms = 0;
         }

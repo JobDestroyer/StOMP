@@ -30,7 +30,11 @@ uint32_t ringbuf_fill(const RingBuf *rb)
 {
     uint32_t w = atomic_load_explicit(&rb->w, memory_order_acquire);
     uint32_t r = atomic_load_explicit(&rb->r, memory_order_relaxed);
-    return w - r;
+    uint32_t fill = w - r;
+    if (fill > rb->cap_frames) {
+        return 0;
+    }
+    return fill;
 }
 
 uint32_t ringbuf_space(const RingBuf *rb)
@@ -43,7 +47,11 @@ uint32_t ringbuf_write(RingBuf *rb, const float *interleaved, uint32_t frames)
     uint32_t w = atomic_load_explicit(&rb->w, memory_order_relaxed);
     uint32_t r = atomic_load_explicit(&rb->r, memory_order_acquire);
     uint32_t fill = w - r;
-    uint32_t space = rb->cap_frames - fill;
+    uint32_t space;
+    if (fill > rb->cap_frames) {
+        fill = 0;
+    }
+    space = rb->cap_frames - fill;
     if (frames > space) {
         frames = space;
     }
@@ -61,6 +69,9 @@ uint32_t ringbuf_read(RingBuf *rb, float *interleaved, uint32_t frames)
     uint32_t r = atomic_load_explicit(&rb->r, memory_order_relaxed);
     uint32_t w = atomic_load_explicit(&rb->w, memory_order_acquire);
     uint32_t fill = w - r;
+    if (fill > rb->cap_frames) {
+        fill = 0;
+    }
     if (frames > fill) {
         frames = fill;
     }
