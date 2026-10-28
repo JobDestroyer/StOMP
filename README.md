@@ -5,8 +5,9 @@ SteamOs Music Player (StOMP) 0.2 is a CONTROLLER-FIRST music player intended for
 Features: 
  - FAST!
  - Milkdrop-style effects thanks to ProjectM
- - A controller-first user interface with keyboard availability if you need it
+ - A controller-first user interface with keyboard/mouse availability if you need it
  - Internet Radio built-in
+ - Karaoke!
  - Single executable for easy management
  - No tracking or weird network calls; it never connects to the internet unless you try to play internet radio
  - Written in C
